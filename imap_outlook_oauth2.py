@@ -243,8 +243,10 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("键盘退出")
+        sys.exit(0)
     except Exception as exc:
         print(f"运行失败: {exc}", file=sys.stderr)
         raise SystemExit(1)
-
-
+    pass
