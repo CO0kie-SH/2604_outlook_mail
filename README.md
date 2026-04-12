@@ -31,10 +31,11 @@
 ## ✅ 核心功能
 
 - ✅ 自动建立本地 WebSocket 通道：`/ws/mail`
+- ✅ 内置接口文档页面：`/doc/mail`、`/doc/feishu`
 - ✅ 基于 JSON-RPC 2.0 的统一请求/响应格式
 - ✅ 登录流程安全队列化（确认与 token 更新串行处理）
 - ✅ Outlook OAuth2 token 获取（优先 refresh_token，回退设备码/缓存）
-- ✅ 邮箱文件夹列表同步并落盘：`config/<前缀>_folders.csv`
+- ✅ 邮箱文件夹列表同步并落盘：`result/<前缀>_folders.csv`
 - ✅ 文件夹邮件数同步：`mail.folder.count`
 - ✅ 文件夹标题与发件人同步：`title`
 - ✅ 标题 CSV 自动按送达时间升序落盘（旧 -> 新）
@@ -65,11 +66,14 @@
 ├── client/
 │   └── internal_ws_client.py       # 内部 WebSocket 客户端
 ├── server/
-│   └── websocket_server.py         # 内部 WebSocket 服务端
+│   ├── websocket_server.py         # 内部 WebSocket 服务端
+│   └── rpc_docs.py                 # 接口文档页面与渲染逻辑
 ├── config/
 │   ├── OutLook.csv                 # Outlook 账号配置
-│   ├── FeiShu.csv                  # 飞书通知配置
-│   └── *_folders.csv               # 文件夹列表与同步状态
+│   └── FeiShu.csv                  # 飞书通知配置
+├── result/
+│   ├── *_folders.csv               # 文件夹列表与同步状态
+│   └── *_<folder>.csv              # 标题结果文件
 └── log/
     └── YYYYMMDD.log                # 运行日志
 ```
@@ -81,6 +85,7 @@
 ### WebSocket 基本信息
 
 - 路径：`/ws/mail`
+- 文档：`/doc/mail`、`/doc/feishu`
 - 协议：`JSON-RPC 2.0`
 - 心跳：20 秒
 
@@ -113,6 +118,7 @@
 | `outlook.token.acquire` | 获取/复用 token，并返回文件夹列表 | `cookie` |
 | `mail.folder.count` | 查询单文件夹邮件数量 | `cookie`, `folder_name`, `current_count` |
 | `title` | 查询单文件夹邮件标题、发件人、时间 | `cookie`, `folder_name` |
+| `feishu.notify` | 服务端发送飞书通知 | `cookie`, `body`, `title?`, `tag?` |
 | `auth.logout` | 注销会话并清理 cookie | `cookie` |
 
 ---
@@ -125,7 +131,7 @@
 3) 客户端调用 auth.login -> 获取 cookie
 4) 客户端调用 auth.confirm -> 确认登录
 5) 客户端调用 outlook.token.acquire -> 获取 folders
-6) 客户端落盘 config/<前缀>_folders.csv
+6) 客户端落盘 result/<前缀>_folders.csv
 7) 按 mode 执行扩展：
    - num   -> 调用 mail.folder.count 并回写计数
    - title -> 先 count，再调用 title 落盘标题 CSV
@@ -153,7 +159,7 @@
 - `user/password/client_id/refresh_token` 支持 URL-safe Base64（无 `=`）
 - 环境变量优先级高于 CSV（如 `OUTLOOK_EMAIL`、`OUTLOOK_CLIENT_ID`）
 
-### 2) 文件夹同步配置：`config/<前缀>_folders.csv`
+### 2) 文件夹同步配置：`result/<前缀>_folders.csv`
 
 字段：
 
@@ -172,11 +178,13 @@
 - `num`：同步邮件数量
 - `title`：同步数量 + 标题数据
 
-### 3) 标题结果文件：`config/<前缀>_<文件夹名>.csv`
+### 3) 标题结果文件：`result/<前缀>_<文件夹名>.csv`
 
 字段：
 
 - `mail_id`
+- `uid`
+- `message_id`
 - `sender`
 - `title`
 - `received_at`
@@ -185,7 +193,7 @@
 
 ### 4) 飞书配置：`config/FeiShu.csv`
 
-当 `mode=title` 抓取到邮件标题后，客户端会自动发送飞书通知。
+当 `mode=title` 抓取到邮件标题后，客户端会发起 `feishu.notify`，由服务端统一发送飞书通知。
 
 字段：
 
@@ -313,9 +321,9 @@ python main.py
 
 ## 🏷️ 版本
 
-> 🟢 Stable: `26.4.12L`
+> 🟢 Stable: `26.4.12M`
 
-当前版本：`26.4.12L`  
+当前版本：`26.4.12M`  
 最后更新：`2026-04-12`
 
 ```text
@@ -326,6 +334,14 @@ python main.py
 ---
 
 ## 📝 更新日志
+
+### 26.4.12M (2026-04-12)
+
+- 🔧 重构：将接口文档页面从 `server/websocket_server.py` 拆分到独立模块 `server/rpc_docs.py`，由独立类负责 HTML 文档渲染。
+- ✨ 新增：文档路由 `/doc/mail` 与 `/doc/feishu`，覆盖参数、返回字段、错误码和 JSON-RPC 示例。
+- 🔧 优化：客户端标题通知改为调用 JSON-RPC `feishu.notify`，由服务端统一执行飞书发送。
+- 🔧 优化：文件夹与标题 CSV 输出路径统一为 `result/` 目录。
+- ✨ 新增：标题结果字段扩展为 `mail_id,uid,message_id,sender,title,received_at,received_unixtime_ms,unixtime_ms`。
 
 ### 26.4.12L (2026-04-12)
 

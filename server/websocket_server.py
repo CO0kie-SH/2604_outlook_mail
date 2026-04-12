@@ -3,6 +3,7 @@ import email
 import imaplib
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -14,7 +15,9 @@ from typing import Any
 
 from aiohttp import web
 
+from feishu_notifier import send_feishu_message
 import imap_outlook_oauth2
+from server.rpc_docs import InternalWSDocPages
 
 
 class InternalWSServer:
@@ -29,12 +32,14 @@ class InternalWSServer:
     RPC_METHOD_ACQUIRE = "outlook.token.acquire"
     RPC_METHOD_FOLDER_COUNT = "mail.folder.count"
     RPC_METHOD_TITLE = "title"
+    RPC_METHOD_FEISHU_NOTIFY = "feishu.notify"
     RPC_METHOD_LOGOUT = "auth.logout"
 
     def __init__(self, host: str, port: int, logger):
         self.host = host
         self.port = port
         self.logger = logger
+        self._doc_pages = InternalWSDocPages()
 
         self.ready_event = threading.Event()
         self.shutdown_requested_event = threading.Event()
@@ -98,7 +103,13 @@ class InternalWSServer:
 
     async def _start_app(self) -> None:
         app = web.Application()
-        app.add_routes([web.get("/ws/mail", self._handle_mail_ws)])
+        app.add_routes(
+            [
+                web.get("/ws/mail", self._handle_mail_ws),
+                web.get("/doc/mail", self._doc_pages.handle_doc_mail),
+                web.get("/doc/feishu", self._doc_pages.handle_doc_feishu),
+            ]
+        )
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
@@ -178,6 +189,7 @@ class InternalWSServer:
                             self.RPC_METHOD_ACQUIRE,
                             self.RPC_METHOD_FOLDER_COUNT,
                             self.RPC_METHOD_TITLE,
+                            self.RPC_METHOD_FEISHU_NOTIFY,
                             self.RPC_METHOD_LOGOUT,
                         ],
                     },
@@ -273,6 +285,38 @@ class InternalWSServer:
                 return self._rpc_error(rpc_id, -32006, data.get("message", "folder titles failed"), req_unixtime), None
             return self._rpc_result(rpc_id, data, req_unixtime), cookie
 
+        if method == self.RPC_METHOD_FEISHU_NOTIFY:
+            cookie = str(params.get("cookie", "")).strip() or current_cookie
+            body = str(params.get("body", "")).strip()
+            title_raw = params.get("title")
+            tag_raw = params.get("tag")
+            title = str(title_raw).strip() if title_raw is not None else None
+            tag = str(tag_raw).strip() if tag_raw is not None else None
+
+            if not cookie:
+                return self._rpc_error(rpc_id, -32602, "cookie required", req_unixtime), None
+            if not body:
+                return self._rpc_error(rpc_id, -32602, "body required", req_unixtime), None
+            with self._session_lock:
+                session = self._sessions.get(cookie)
+            if session is None:
+                return self._rpc_error(rpc_id, -32007, "invalid cookie", req_unixtime), None
+            try:
+                results = await send_feishu_message(self.logger, v_body=body, v_title=title, tag=tag)
+                success_count = sum(1 for ok in results.values() if ok)
+                return self._rpc_result(
+                    rpc_id,
+                    {
+                        "success": True,
+                        "results": results,
+                        "success_count": success_count,
+                    },
+                    req_unixtime,
+                ), cookie
+            except Exception as exc:
+                self.logger.exception("feishu notify failed")
+                return self._rpc_error(rpc_id, -32008, str(exc), req_unixtime), None
+
         if method == self.RPC_METHOD_LOGOUT:
             cookie = str(params.get("cookie", "")).strip() or current_cookie
             if not cookie:
@@ -318,6 +362,7 @@ class InternalWSServer:
                 self.RPC_METHOD_ACQUIRE,
                 self.RPC_METHOD_FOLDER_COUNT,
                 self.RPC_METHOD_TITLE,
+                self.RPC_METHOD_FEISHU_NOTIFY,
                 self.RPC_METHOD_LOGOUT,
             ],
         }
@@ -492,7 +537,7 @@ class InternalWSServer:
             rows: list[dict[str, Any]] = []
             sender_missing_count = 0
             for msg_id in data[0].split():
-                typ, msg_data = imap.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM)])")
+                typ, msg_data = imap.fetch(msg_id, "(UID BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM MESSAGE-ID)])")
                 if typ != "OK" or not msg_data or not msg_data[0] or not msg_data[0][1]:
                     continue
 
@@ -520,9 +565,20 @@ class InternalWSServer:
                     except Exception:
                         pass
 
+                uid = ""
+                fetch_meta = msg_data[0][0]
+                if isinstance(fetch_meta, bytes):
+                    meta_text = fetch_meta.decode("ascii", errors="ignore")
+                    uid_match = re.search(r"\bUID\s+(\d+)\b", meta_text)
+                    if uid_match:
+                        uid = uid_match.group(1)
+
+                message_id = str(msg.get("Message-ID", "") or "").strip()
                 rows.append(
                     {
                         "mail_id": msg_id.decode("ascii", errors="ignore"),
+                        "uid": uid,
+                        "message_id": message_id,
                         "title": title,
                         "sender": str(sender or ""),
                         "received_at": received_at,

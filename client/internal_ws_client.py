@@ -11,8 +11,6 @@ from typing import Any
 
 import aiohttp
 
-from feishu_notifier import send_feishu_message
-
 
 class InternalWSClient:
     """邮件模块 WebSocket 客户端，按 JSON-RPC 2.0 流程完成一次登录与查询。"""
@@ -29,6 +27,8 @@ class InternalWSClient:
     ]
     TITLE_CSV_FIELDS = [
         "mail_id",
+        "uid",
+        "message_id",
         "sender",
         "title",
         "received_at",
@@ -217,7 +217,7 @@ class InternalWSClient:
         account = (self.account or "").strip()
         local_part = account.split("@", 1)[0].strip() if account else ""
         safe_prefix = re.sub(r"[\\/:*?\"<>|]", "_", local_part) or "mail"
-        output = Path("config") / f"{safe_prefix}_folders.csv"
+        output = Path("result") / f"{safe_prefix}_folders.csv"
         output.parent.mkdir(parents=True, exist_ok=True)
         now_ms = int(time.time() * 1000)
 
@@ -350,14 +350,14 @@ class InternalWSClient:
             self._set_file_readonly(csv_path)
         self.logger.info("folders csv synced by mode=num/title: %s", csv_path)
         if pending_notifications:
-            await self._send_title_notifications_batch(pending_notifications)
+            await self._send_title_notifications_batch(ws, cookie, pending_notifications)
 
     def _save_titles_to_csv(self, folder_name: str, titles: Any, expected_count: int) -> None:
         account = (self.account or "").strip()
         local_part = account.split("@", 1)[0].strip() if account else ""
         safe_prefix = re.sub(r"[\\/:*?\"<>|]", "_", local_part) or "mail"
         safe_folder = re.sub(r"[\\/:*?\"<>|]", "_", folder_name.strip()) or "folder"
-        output = Path("config") / f"{safe_prefix}_{safe_folder}.csv"
+        output = Path("result") / f"{safe_prefix}_{safe_folder}.csv"
         output.parent.mkdir(parents=True, exist_ok=True)
 
         rows: list[dict[str, Any]] = []
@@ -369,6 +369,8 @@ class InternalWSClient:
                     {
                         "unixtime_ms": int(time.time() * 1000),
                         "mail_id": str(item.get("mail_id", "")),
+                        "uid": str(item.get("uid", "")),
+                        "message_id": str(item.get("message_id", "")),
                         "title": str(item.get("title", "")),
                         "sender": str(item.get("sender", "")),
                         "received_at": str(item.get("received_at", "")),
@@ -437,7 +439,12 @@ class InternalWSClient:
             return clean
         return f"{clean[:limit]}..."
 
-    async def _send_title_notifications_batch(self, notifications: list[dict[str, Any]]) -> None:
+    async def _send_title_notifications_batch(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        cookie: str,
+        notifications: list[dict[str, Any]],
+    ) -> None:
         if not notifications:
             return
 
@@ -470,8 +477,19 @@ class InternalWSClient:
 
         title = f"Outlook标题抓取更新/{self.account}"
         try:
-            results = await send_feishu_message(self.logger, body, v_title=title)
-            success_count = sum(1 for ok in results.values() if ok)
+            rpc_result = await self._rpc_call(
+                ws,
+                rpc_id=900000 + len(notifications),
+                method="feishu.notify",
+                params={
+                    "cookie": cookie,
+                    "body": body,
+                    "title": title,
+                },
+            )
+            results = rpc_result.get("results", {})
+            results = results if isinstance(results, dict) else {}
+            success_count = int(rpc_result.get("success_count", 0))
             self.logger.info(
                 "feishu title notify sent: folders=%s targets=%s success=%s",
                 len(notifications),
