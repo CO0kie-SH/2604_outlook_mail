@@ -10,3 +10,4 @@ db/
 
 # Local secrets/config
 config/OutLook.local.csv
+config/OutLook.csv
