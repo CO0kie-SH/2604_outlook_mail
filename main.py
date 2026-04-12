@@ -9,11 +9,30 @@ from client.internal_ws_client import InternalWSClient
 from server.websocket_server import InternalWSServer
 
 
+def resolve_default_client_account() -> str:
+    account_from_env = os.getenv("WS_CLIENT_ACCOUNT", "").strip()
+    if account_from_env:
+        return account_from_env
+
+    try:
+        profile = os.getenv("OUTLOOK_PROFILE", "outlook")
+        config_path = Path(imap_outlook_oauth2.resolve_default_config_path())
+        row = imap_outlook_oauth2.OutlookMailService.load_outlook_config(config_path, profile)
+        email_addr = (row.get("user", "") or "").strip()
+        if email_addr and "@" in email_addr:
+            return email_addr.split("@", 1)[0].strip() or "mail"
+        if email_addr:
+            return email_addr
+    except Exception:
+        pass
+    return "mail"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="WebSocket server/client threaded runtime")
     parser.add_argument("--server-host", default=os.getenv("WS_SERVER_HOST", "127.0.0.1"))
     parser.add_argument("--server-port", type=int, default=int(os.getenv("WS_SERVER_PORT", "8765")))
-    parser.add_argument("--client-account", default=os.getenv("WS_CLIENT_ACCOUNT", "outlook_demo"))
+    parser.add_argument("--client-account", default=resolve_default_client_account())
     parser.add_argument("--client-password", default=os.getenv("WS_CLIENT_PASSWORD", "******"))
     parser.add_argument("--log-level", default=os.getenv("OUTLOOK_LOG_LEVEL", "INFO"), help="log level")
     parser.add_argument("--log-file", default=imap_outlook_oauth2.resolve_default_log_file(), help="log path")
