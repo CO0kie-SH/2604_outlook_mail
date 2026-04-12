@@ -25,7 +25,7 @@ JSON-RPC 约定：
 5. 客户端发送 `auth.confirm`（携带 cookie），服务端经安全队列确认登录并返回可用接口
 6. 客户端调用 `outlook.token.acquire` 请求 token 信息
 7. 服务端按 cookie 维护 token（缓存到安全队列），并返回该邮箱文件夹列表（每项包含 `name` 和 `flags`）
-8. 客户端拿到首次文件夹列表后，先保存到 `config/mail_folders.csv`，再调用 `auth.logout`
+8. 客户端拿到首次文件夹列表后，保存到 `config/<邮箱前缀>_folders.csv`，并按 `mode` 执行扩展处理：`num` 查询数量；`title` 先执行 `num` 同步再查询标题，并按送达时间升序保存到 `config/<邮箱前缀>_<文件夹名>.csv`
 9. 服务端删除 cookie 与会话信息
 
 补充：若连接数连续两次检查为 0（即约 60 秒无人连接），服务端触发程序退出。
@@ -50,10 +50,25 @@ powershell -Command "Invoke-Expression -Command 'cmd.exe /c main.bat'"
 ```
 
 ## 版本
-当前版本：`26.4.12G`
+当前版本：`26.4.12J`
 最后更新：`2026-04-12`
 
 ## 更新日志
+### 26.4.12J (2026-04-12)
+- 新增：`mode=title` 返回并落盘发件人信息字段 `sender`
+- 优化：标题 CSV 结构扩展为 `mail_id,title,sender,received_at,received_unixtime_ms`
+
+### 26.4.12I (2026-04-12)
+- 新增：支持 `mode=title`，客户端调用 JSON-RPC `title` 接口获取指定文件夹邮件标题
+- 新增：服务端读取邮件 `Date` 送达时间并返回，客户端按送达时间降序排序
+- 新增：客户端按 `前缀_文件夹名.csv` 落盘标题结果（例如 `MarkGordon7281_Inbox.csv`）
+
+### 26.4.12H (2026-04-12)
+- 新增：客户端支持读取 `*_folders.csv` 的扩展字段（`mode/current_count/online_count/current_unixtime_ms/update_unixtime_ms`）
+- 新增：`mode=num` 时调用 JSON-RPC `mail.folder.count` 查询指定文件夹数量，`current_count` 为空时按 `0` 发送
+- 新增：服务端增加 `mail.folder.count` 方法，返回 `success` 与对应文件夹数量
+- 优化：客户端收到结果后回写本地 CSV（在线数量、当前计数、更新时间戳）
+
 ### 26.4.12G (2026-04-12)
 - 优化：客户端 JSON-RPC 调用增加超时控制（20秒）与响应时间戳一致性校验
 - 优化：服务端统一毫秒时间戳生成逻辑，并增强 `unixtime_ms` 非法值兜底处理

@@ -1,4 +1,5 @@
 import asyncio
+import email
 import imaplib
 import json
 import os
@@ -6,6 +7,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime, parseaddr
 from queue import Empty, Queue
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +27,8 @@ class InternalWSServer:
     RPC_METHOD_LOGIN = "auth.login"
     RPC_METHOD_CONFIRM = "auth.confirm"
     RPC_METHOD_ACQUIRE = "outlook.token.acquire"
+    RPC_METHOD_FOLDER_COUNT = "mail.folder.count"
+    RPC_METHOD_TITLE = "title"
     RPC_METHOD_LOGOUT = "auth.logout"
 
     def __init__(self, host: str, port: int, logger):
@@ -172,6 +176,8 @@ class InternalWSServer:
                             self.RPC_METHOD_LOGIN,
                             self.RPC_METHOD_CONFIRM,
                             self.RPC_METHOD_ACQUIRE,
+                            self.RPC_METHOD_FOLDER_COUNT,
+                            self.RPC_METHOD_TITLE,
                             self.RPC_METHOD_LOGOUT,
                         ],
                     },
@@ -239,6 +245,34 @@ class InternalWSServer:
                 return self._rpc_error(rpc_id, -32004, data.get("message", "token acquire failed"), req_unixtime), None
             return self._rpc_result(rpc_id, data, req_unixtime), cookie
 
+        if method == self.RPC_METHOD_FOLDER_COUNT:
+            cookie = str(params.get("cookie", "")).strip() or current_cookie
+            folder_name = str(params.get("folder_name", "")).strip()
+            if not cookie or not folder_name:
+                return self._rpc_error(rpc_id, -32602, "cookie and folder_name required", req_unixtime), None
+
+            current_count_raw = params.get("current_count", 0)
+            try:
+                current_count = int(current_count_raw)
+            except (TypeError, ValueError):
+                current_count = 0
+
+            ok, data = await asyncio.to_thread(self._query_folder_count, cookie, folder_name, current_count)
+            if not ok:
+                return self._rpc_error(rpc_id, -32005, data.get("message", "folder count failed"), req_unixtime), None
+            return self._rpc_result(rpc_id, data, req_unixtime), cookie
+
+        if method == self.RPC_METHOD_TITLE:
+            cookie = str(params.get("cookie", "")).strip() or current_cookie
+            folder_name = str(params.get("folder_name", "")).strip()
+            if not cookie or not folder_name:
+                return self._rpc_error(rpc_id, -32602, "cookie and folder_name required", req_unixtime), None
+
+            ok, data = await asyncio.to_thread(self._query_folder_titles, cookie, folder_name)
+            if not ok:
+                return self._rpc_error(rpc_id, -32006, data.get("message", "folder titles failed"), req_unixtime), None
+            return self._rpc_result(rpc_id, data, req_unixtime), cookie
+
         if method == self.RPC_METHOD_LOGOUT:
             cookie = str(params.get("cookie", "")).strip() or current_cookie
             if not cookie:
@@ -282,6 +316,8 @@ class InternalWSServer:
             "cookie": cookie,
             "enabled_methods": [
                 self.RPC_METHOD_ACQUIRE,
+                self.RPC_METHOD_FOLDER_COUNT,
+                self.RPC_METHOD_TITLE,
                 self.RPC_METHOD_LOGOUT,
             ],
         }
@@ -344,6 +380,53 @@ class InternalWSServer:
         config = imap_outlook_oauth2.build_runtime_config(args)
         return imap_outlook_oauth2.OutlookMailService(config, self.logger)
 
+    def _query_folder_count(self, cookie: str, folder_name: str, current_count: int) -> tuple[bool, dict[str, Any]]:
+        with self._session_lock:
+            session = self._sessions.get(cookie)
+            if session is None:
+                return False, {"message": "invalid cookie"}
+            access_token = str(session.get("access_token", "")).strip()
+
+        if not access_token:
+            return False, {"message": "token not ready, call outlook.token.acquire first"}
+
+        try:
+            service = self._build_outlook_service()
+            folder_count = self._fetch_folder_count(service, access_token, folder_name)
+            return True, {
+                "success": True,
+                "folder_name": folder_name,
+                "request_current_count": current_count,
+                "folder_count": folder_count,
+                "update_unixtime_ms": self._now_ms(),
+            }
+        except Exception as exc:
+            self.logger.exception("query folder count failed: folder=%s", folder_name)
+            return False, {"message": str(exc)}
+
+    def _query_folder_titles(self, cookie: str, folder_name: str) -> tuple[bool, dict[str, Any]]:
+        with self._session_lock:
+            session = self._sessions.get(cookie)
+            if session is None:
+                return False, {"message": "invalid cookie"}
+            access_token = str(session.get("access_token", "")).strip()
+
+        if not access_token:
+            return False, {"message": "token not ready, call outlook.token.acquire first"}
+
+        try:
+            service = self._build_outlook_service()
+            titles = self._fetch_folder_titles(service, access_token, folder_name)
+            return True, {
+                "success": True,
+                "folder_name": folder_name,
+                "titles": titles,
+                "update_unixtime_ms": self._now_ms(),
+            }
+        except Exception as exc:
+            self.logger.exception("query folder titles failed: folder=%s", folder_name)
+            return False, {"message": str(exc)}
+
     def _fetch_mailbox_folders(self, service: imap_outlook_oauth2.OutlookMailService, access_token: str) -> list[dict[str, Any]]:
         self.logger.info("query mailbox folders by token")
         imap = imaplib.IMAP4_SSL(service.config.host, service.config.port)
@@ -358,6 +441,107 @@ class InternalWSServer:
                 flags = [str(x) for x in item.get("flags", [])]
                 normalized.append({"name": name, "flags": flags})
             return normalized
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
+    def _fetch_folder_count(self, service: imap_outlook_oauth2.OutlookMailService, access_token: str, folder_name: str) -> int:
+        imap = imaplib.IMAP4_SSL(service.config.host, service.config.port)
+        try:
+            xoauth2 = service.build_xoauth2(service.config.email_addr, access_token)
+            imap.authenticate("XOAUTH2", lambda _: xoauth2)
+            mailbox_name, _ = service.resolve_mailbox_name(imap, folder_name)
+            typ, _ = imap.select(mailbox_name)
+            if typ != "OK":
+                raise RuntimeError(f"select mailbox failed: {folder_name}")
+            typ, data = imap.search(None, "ALL")
+            if typ != "OK":
+                raise RuntimeError(f"search mailbox failed: {folder_name}")
+            if not data or not data[0]:
+                return 0
+            return len(data[0].split())
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
+    def _fetch_folder_titles(
+        self,
+        service: imap_outlook_oauth2.OutlookMailService,
+        access_token: str,
+        folder_name: str,
+    ) -> list[dict[str, Any]]:
+        imap = imaplib.IMAP4_SSL(service.config.host, service.config.port)
+        try:
+            xoauth2 = service.build_xoauth2(service.config.email_addr, access_token)
+            imap.authenticate("XOAUTH2", lambda _: xoauth2)
+            mailbox_name, _ = service.resolve_mailbox_name(imap, folder_name)
+            typ, _ = imap.select(mailbox_name)
+            if typ != "OK":
+                raise RuntimeError(f"select mailbox failed: {folder_name}")
+
+            typ, data = imap.search(None, "ALL")
+            if typ != "OK":
+                raise RuntimeError(f"search mailbox failed: {folder_name}")
+            if not data or not data[0]:
+                return []
+
+            rows: list[dict[str, Any]] = []
+            sender_missing_count = 0
+            for msg_id in data[0].split():
+                typ, msg_data = imap.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM)])")
+                if typ != "OK" or not msg_data or not msg_data[0] or not msg_data[0][1]:
+                    continue
+
+                msg = email.message_from_bytes(msg_data[0][1] or b"")
+                title = service.decode_mime_words(msg.get("Subject", "")) or "(无主题)"
+                raw_from = str(msg.get("From", "") or "").strip()
+                decoded_from = service.decode_mime_words(raw_from) if raw_from else ""
+                _, sender_email = parseaddr(decoded_from or raw_from)
+                sender = decoded_from or sender_email or raw_from
+                sender = " ".join(str(sender).split())
+                if not sender:
+                    sender_missing_count += 1
+                date_raw = str(msg.get("Date", "")).strip()
+                received_unixtime_ms = 0
+                received_at = ""
+                if date_raw:
+                    try:
+                        dt = parsedate_to_datetime(date_raw)
+                        if dt is not None:
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            dt = dt.astimezone(timezone.utc)
+                            received_unixtime_ms = int(dt.timestamp() * 1000)
+                            received_at = dt.isoformat()
+                    except Exception:
+                        pass
+
+                rows.append(
+                    {
+                        "mail_id": msg_id.decode("ascii", errors="ignore"),
+                        "title": title,
+                        "sender": str(sender or ""),
+                        "received_at": received_at,
+                        "received_unixtime_ms": received_unixtime_ms,
+                    }
+                )
+            self.logger.info(
+                "folder titles fetched: folder=%s total=%s sender_missing=%s",
+                folder_name,
+                len(rows),
+                sender_missing_count,
+            )
+            if sender_missing_count > 0:
+                self.logger.warning(
+                    "some mails have empty From header: folder=%s missing=%s",
+                    folder_name,
+                    sender_missing_count,
+                )
+            return rows
         finally:
             try:
                 imap.logout()

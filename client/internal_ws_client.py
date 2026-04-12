@@ -3,6 +3,7 @@ import csv
 from contextlib import suppress
 import json
 import re
+import stat
 import threading
 import time
 from pathlib import Path
@@ -14,6 +15,24 @@ import aiohttp
 class InternalWSClient:
     """邮件模块 WebSocket 客户端，按 JSON-RPC 2.0 流程完成一次登录与查询。"""
     RPC_TIMEOUT_SECONDS = 20
+    FOLDER_CSV_FIELDS = [
+        "unixtime_ms",
+        "name",
+        "flags",
+        "mode",
+        "current_count",
+        "online_count",
+        "current_unixtime_ms",
+        "update_unixtime_ms",
+    ]
+    TITLE_CSV_FIELDS = [
+        "mail_id",
+        "sender",
+        "title",
+        "received_at",
+        "received_unixtime_ms",
+        "unixtime_ms",
+    ]
 
     def __init__(
         self,
@@ -112,7 +131,8 @@ class InternalWSClient:
                     len(folders) if isinstance(folders, list) else 0,
                 )
                 self.logger.info("folders=%s", self._format_folders_for_log(folders))
-                self._save_folders_to_csv(folders)
+                csv_path = self._save_folders_to_csv(folders)
+                await self._sync_mode_num_counts(ws, cookie, csv_path)
 
                 # 5) 首次拿到邮件数后退出登录，不再重复登录。
                 logout_resp = await self._rpc_call(
@@ -187,7 +207,7 @@ class InternalWSClient:
             )
         return normalized
 
-    def _save_folders_to_csv(self, folders: Any) -> None:
+    def _save_folders_to_csv(self, folders: Any) -> Path:
         rows = sorted(self._format_folders_for_log(folders), key=lambda x: x.get("name", "").lower())
         account = (self.account or "").strip()
         local_part = account.split("@", 1)[0].strip() if account else ""
@@ -196,15 +216,195 @@ class InternalWSClient:
         output.parent.mkdir(parents=True, exist_ok=True)
         now_ms = int(time.time() * 1000)
 
-        with output.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["unixtime_ms", "name", "flags"])
-            writer.writeheader()
-            for item in rows:
-                writer.writerow(
+        existing_by_name = self._load_existing_rows_by_name(output)
+        self._set_file_writable(output)
+        try:
+            with output.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.FOLDER_CSV_FIELDS)
+                writer.writeheader()
+                for item in rows:
+                    existed = existing_by_name.get(item["name"], {})
+                    writer.writerow(
+                        {
+                            "unixtime_ms": now_ms,
+                            "name": item["name"],
+                            "flags": json.dumps(item["flags"], ensure_ascii=False),
+                            "mode": existed.get("mode", ""),
+                            "current_count": existed.get("current_count", ""),
+                            "online_count": existed.get("online_count", ""),
+                            "current_unixtime_ms": existed.get("current_unixtime_ms", ""),
+                            "update_unixtime_ms": existed.get("update_unixtime_ms", ""),
+                        }
+                    )
+        finally:
+            self._set_file_readonly(output)
+        self.logger.info("folders csv saved: %s", output.resolve())
+        return output.resolve()
+
+    @staticmethod
+    def _load_existing_rows_by_name(path: Path) -> dict[str, dict[str, Any]]:
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        result: dict[str, dict[str, Any]] = {}
+        for idx, row in enumerate(rows):
+            name = str(row.get("name", "")).strip()
+            if name:
+                result[name] = row
+        return result
+
+    async def _sync_mode_num_counts(self, ws: aiohttp.ClientWebSocketResponse, cookie: str, csv_path: Path) -> None:
+        self._set_file_writable(csv_path)
+        try:
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.DictReader(f))
+
+            changed = False
+            for idx, row in enumerate(rows):
+                mode = str(row.get("mode", "")).strip().lower()
+                folder_name = str(row.get("name", "")).strip()
+                if not folder_name:
+                    continue
+
+                if mode not in {"num", "title"}:
+                    continue
+
+                current_raw = str(row.get("current_count", "")).strip()
+                try:
+                    request_count = int(current_raw) if current_raw else 0
+                except ValueError:
+                    request_count = 0
+
+                rpc_result = await self._rpc_call(
+                    ws,
+                    rpc_id=10 + idx,
+                    method="mail.folder.count",
+                    params={
+                        "cookie": cookie,
+                        "folder_name": folder_name,
+                        "current_count": request_count,
+                    },
+                )
+
+                if not rpc_result.get("success"):
+                    continue
+
+                online_count = int(rpc_result.get("folder_count", 0))
+                update_ms = int(rpc_result.get("update_unixtime_ms", int(time.time() * 1000)))
+                row["online_count"] = str(online_count)
+                row["current_count"] = str(online_count)
+                row["current_unixtime_ms"] = str(update_ms)
+                row["update_unixtime_ms"] = str(update_ms)
+                changed = True
+                self.logger.info(
+                    "folder count synced: folder=%s request_count=%s online_count=%s",
+                    folder_name,
+                    request_count,
+                    online_count,
+                )
+
+                if mode == "title":
+                    title_result = await self._rpc_call(
+                        ws,
+                        rpc_id=1000 + idx,
+                        method="title",
+                        params={
+                            "cookie": cookie,
+                            "folder_name": folder_name,
+                        },
+                    )
+                    if title_result.get("success"):
+                        titles = title_result.get("titles", [])
+                        self._save_titles_to_csv(folder_name, titles, online_count)
+                        self.logger.info(
+                            "folder titles synced: folder=%s title_count=%s expected_count=%s",
+                            folder_name,
+                            len(titles) if isinstance(titles, list) else 0,
+                            online_count,
+                        )
+
+            if not changed:
+                return
+
+            with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.FOLDER_CSV_FIELDS)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") for key in self.FOLDER_CSV_FIELDS})
+        finally:
+            self._set_file_readonly(csv_path)
+        self.logger.info("folders csv synced by mode=num/title: %s", csv_path)
+
+    def _save_titles_to_csv(self, folder_name: str, titles: Any, expected_count: int) -> None:
+        account = (self.account or "").strip()
+        local_part = account.split("@", 1)[0].strip() if account else ""
+        safe_prefix = re.sub(r"[\\/:*?\"<>|]", "_", local_part) or "mail"
+        safe_folder = re.sub(r"[\\/:*?\"<>|]", "_", folder_name.strip()) or "folder"
+        output = Path("config") / f"{safe_prefix}_{safe_folder}.csv"
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        rows: list[dict[str, Any]] = []
+        if isinstance(titles, list):
+            for item in titles:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
                     {
-                        "unixtime_ms": now_ms,
-                        "name": item["name"],
-                        "flags": json.dumps(item["flags"], ensure_ascii=False),
+                        "unixtime_ms": int(time.time() * 1000),
+                        "mail_id": str(item.get("mail_id", "")),
+                        "title": str(item.get("title", "")),
+                        "sender": str(item.get("sender", "")),
+                        "received_at": str(item.get("received_at", "")),
+                        "received_unixtime_ms": int(item.get("received_unixtime_ms", 0) or 0),
                     }
                 )
-        self.logger.info("folders csv saved: %s", output.resolve())
+        # 按送达时间升序（旧 -> 新）输出。
+        rows.sort(key=lambda x: x["received_unixtime_ms"])
+        if expected_count >= 0:
+            original_count = len(rows)
+            rows = rows[:expected_count]
+            if original_count != expected_count:
+                self.logger.warning(
+                    "title count mismatch before trim: folder=%s expected=%s actual=%s",
+                    folder_name,
+                    expected_count,
+                    original_count,
+                )
+
+        self._set_file_writable(output)
+        try:
+            with output.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.TITLE_CSV_FIELDS, quoting=csv.QUOTE_ALL)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") for key in self.TITLE_CSV_FIELDS})
+        finally:
+            self._set_file_readonly(output)
+        sender_missing = sum(1 for row in rows if not str(row.get("sender", "")).strip())
+        self.logger.info(
+            "title csv stats: folder=%s rows=%s sender_missing=%s",
+            folder_name,
+            len(rows),
+            sender_missing,
+        )
+        self.logger.info("title csv saved: %s", output.resolve())
+
+    def _set_file_writable(self, path: Path) -> None:
+        if not path.exists():
+            return
+        try:
+            path.chmod(stat.S_IWRITE | stat.S_IREAD)
+            self.logger.debug("set writable: %s", path)
+        except OSError:
+            self.logger.warning("failed to clear readonly attribute: %s", path, exc_info=True)
+
+    def _set_file_readonly(self, path: Path) -> None:
+        if not path.exists():
+            return
+        try:
+            path.chmod(stat.S_IREAD)
+            self.logger.debug("set readonly: %s", path)
+        except OSError:
+            self.logger.warning("failed to set readonly attribute: %s", path, exc_info=True)
