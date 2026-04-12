@@ -15,7 +15,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-port", type=int, default=int(os.getenv("WS_SERVER_PORT", "8765")))
     parser.add_argument("--client-account", default=os.getenv("WS_CLIENT_ACCOUNT", "outlook_demo"))
     parser.add_argument("--client-password", default=os.getenv("WS_CLIENT_PASSWORD", "******"))
-    parser.add_argument("--sync-interval", type=float, default=float(os.getenv("WS_CLIENT_SYNC_INTERVAL", "5")))
     parser.add_argument("--log-level", default=os.getenv("OUTLOOK_LOG_LEVEL", "INFO"), help="log level")
     parser.add_argument("--log-file", default=imap_outlook_oauth2.resolve_default_log_file(), help="log path")
     parser.add_argument(
@@ -49,7 +48,6 @@ def main() -> int:
         server_port=args.server_port,
         account=args.client_account,
         password=args.client_password,
-        sync_interval=max(1.0, args.sync_interval),
         logger=logger,
     )
 
@@ -65,6 +63,9 @@ def main() -> int:
 
     try:
         while True:
+            if server.shutdown_requested_event.is_set():
+                logger.warning("shutdown requested by server idle guard, stopping process")
+                break
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("keyboard interrupt received, shutting down")

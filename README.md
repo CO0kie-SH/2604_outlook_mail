@@ -1,65 +1,44 @@
-﻿# Outlook IMAP 邮件读取工具
+# Outlook WebSocket 邮件模块
 
-一个基于 OAuth2 的 Outlook IMAP 邮件读取脚本，支持使用 `refresh_token` 或设备码流程登录，读取邮箱中的邮件标题与正文。
+本项目当前采用双线程架构：
+- 服务端线程：`aiohttp` WebSocket（邮件模块）
+- 客户端线程：`aiohttp` WebSocket（内部调用方）
 
-## 功能
-- OAuth2 登录（优先 `refresh_token`，兜底设备码）
-- 连接 Outlook IMAP（`outlook.office365.com:993`）
-- 读取指定邮箱目录（默认 `INBOX`）
-- 输出邮件总数、每封邮件时间/标题/正文
-- 兼容 `text/plain` 与 `text/html`（HTML 自动转文本）
-- 支持从 `config/OutLook.csv` 读取账号配置
-- 支持日志等级、按天日志文件与过期日志清理
-- 代码采用类结构（`OutlookMailService`）
+主入口仍为 `main.py`，按项目规则建议通过 `main.bat` 运行。
 
-## 项目结构
-```text
-2604_outlook_mail/
-├── main.py
-├── main.bat
-├── imap_outlook_oauth2.py
-├── 项目规则.md
-├── README.md
-├── config/
-├── db/
-├── log/
-└── tmp/
-```
+## 当前通信协议
+- WebSocket 路径：`/ws/mail`
+- 传输格式：`JSON-RPC 2.0`
 
-## 环境要求
-- Python 3.12
-- 推荐解释器：`D:\0Code2\py312\python.exe`
-- 依赖：`msal`、`aiohttp`
+JSON-RPC 约定：
+- 请求：`{"jsonrpc":"2.0","id":1,"method":"xxx","params":{...}}`
+- 成功响应：`{"jsonrpc":"2.0","id":1,"result":{...}}`
+- 错误响应：`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"..."}}`
+- 通知（无 id）：`{"jsonrpc":"2.0","method":"xxx","params":{...}}`
 
-安装依赖：
-```bash
-D:\0Code2\py312\python.exe -m pip install msal aiohttp
-```
+## 运行流程（当前实现）
+1. 服务端启动，监听 `/ws/mail`，并启动空闲检测线程（每 60 秒检查连接数）
+2. 客户端连接服务端
+3. 服务端先发送能力列表通知：`mail.capabilities`
+4. 客户端首次请求 `auth.login`，服务端返回 `cookie`
+5. 客户端发送 `auth.confirm`（携带 cookie），服务端经安全队列确认登录并返回可用接口
+6. 客户端调用 `outlook.token.acquire` 请求 token 信息
+7. 服务端按 cookie 维护 token（缓存到安全队列），并返回一次 `INBOX` 邮件总数（不含垃圾箱）
+8. 客户端拿到首次邮件总数后，调用 `auth.logout`
+9. 服务端删除 cookie 与会话信息
 
-## 配置方式
-支持两种方式，环境变量优先级更高：
-1. 环境变量（可覆盖 CSV）
-2. CSV 文件（优先读取 `config/OutLook.local.csv`，不存在时读取 `config/OutLook.csv`）
+补充：若连接数连续两次检查为 0（即约 120 秒无人连接），服务端触发程序退出。
 
-### CSV 配置格式
-推荐文件：
-- `config/OutLook.local.csv`（本地私有，不提交）
-- `config/OutLook.csv`（仓库示例）
-
-表头：
-```csv
-mail,user,password,client_id,refresh_token
-```
-
-说明：
-- `mail`：配置标识（默认读取 `outlook`）
-- `user`：邮箱地址
-- `client_id`：Azure 应用 Client ID
-- `refresh_token`：可选，存在时优先使用
-- 字段可为明文或 URL-safe Base64（代码内自动尝试解码）
+## 命令参数
+- `--server-host`：服务端监听地址（默认 `127.0.0.1`）
+- `--server-port`：服务端监听端口（默认 `8765`）
+- `--client-account`：内部客户端登录账号（默认 `outlook_demo`）
+- `--client-password`：内部客户端登录密码（默认 `******`）
+- `--log-level`：日志等级（默认 `INFO`）
+- `--log-file`：日志文件路径（默认 `log/YYYYMMDD.log`）
+- `--log-retention-days`：日志保留天数（默认 `30`）
 
 ## 运行方式
-按项目规则推荐：
 ```bash
 cmd /c main.bat
 ```
@@ -69,74 +48,22 @@ PowerShell：
 powershell -Command "Invoke-Expression -Command 'cmd.exe /c main.bat'"
 ```
 
-直接运行：
-```powershell
-$env:PYTHONIOENCODING='utf-8'
-D:\0Code2\py312\python.exe -B main.py
-```
-
-## 命令参数
-- `--dry-run`：只检查配置，不连接网络
-- `--list-mailboxes`：列出邮箱目录，不读取邮件内容
-- `--mailbox`：邮箱目录（默认 `INBOX`）
-- `--profile`：CSV 中 `mail` 字段（默认 `outlook`）
-- `--config`：CSV 配置路径（默认：若存在 `config/OutLook.local.csv` 则优先使用，否则使用 `config/OutLook.csv`）
-- `--log-level`：日志等级（默认 `INFO`）
-- `--log-file`：日志文件路径（默认 `log/YYYYMMDD.log`）
-- `--log-retention-days`：日志保留天数（默认 `30`）
-
-示例：
-```powershell
-$env:PYTHONIOENCODING='utf-8'
-D:\0Code2\py312\python.exe -B main.py --profile outlook --log-level INFO --log-file log\outlook.log
-```
-
-## 环境变量
-- `OUTLOOK_EMAIL`：邮箱地址（可覆盖 CSV）
-- `OUTLOOK_CLIENT_ID`：Azure 应用 Client ID（可覆盖 CSV）
-- `OUTLOOK_REFRESH_TOKEN`：可选，存在时优先使用（可覆盖 CSV）
-- `OUTLOOK_TENANT`：可选，默认 `consumers`
-- `OUTLOOK_IMAP_HOST`：可选，默认 `outlook.office365.com`
-- `OUTLOOK_IMAP_PORT`：可选，默认 `993`
-- `OUTLOOK_IMAP_MAILBOX`：可选，默认 `INBOX`
-- `OUTLOOK_TOKEN_CACHE`：可选，默认 `.outlook_token_cache.json`
-- `OUTLOOK_PROFILE`：可选，默认 `outlook`
-- `OUTLOOK_CONFIG_PATH`：可选；未设置时默认自动选择 `config/OutLook.local.csv` 或 `config/OutLook.csv`
-- `OUTLOOK_LOG_LEVEL`：可选，默认 `INFO`
-- `OUTLOOK_LOG_FILE`：可选，默认 `log/YYYYMMDD.log`
-- `OUTLOOK_LOG_RETENTION_DAYS`：可选，默认 `30`
-
 ## 版本
-当前版本：`26.4.12D`
+当前版本：`26.4.12F`
 最后更新：`2026-04-12`
 
 ## 更新日志
-### 26.4.12D (2026-04-12)
-- 新增：默认日志路径改为 `log/YYYYMMDD.log`，并支持 `--log-retention-days` 自动清理过期日志
-- 新增：`main.py` 统一初始化 logger，并在启动时打印运行目录、项目目录、日志目录、解释器路径
-- 新增：邮件输出与日志记录均包含时间戳字段（基于邮件 `Date` 头）
-- 优化：提取单封邮件解析逻辑，减少 `fetch_all_mails` 内重复分支代码，提升可维护性
+### 26.4.12F (2026-04-12)
+- 重构：WebSocket 路径改为 `/ws/mail`，用于邮件模块，移除旧 `/ws/internal`
+- 重构：移除全部 `/api/*` HTTP 接口，统一改为 JSON-RPC 2.0
+- 新增：服务端首次连接下发 `mail.capabilities` 能力列表
+- 新增：登录确认、token 维护、会话维护统一通过线程安全队列处理
+- 新增：`outlook.token.acquire` 返回 token 信息及一次 `INBOX` 邮件总数
+- 新增：客户端完成首次流程后主动 `auth.logout`，不再重复登录
+- 新增：服务端每 60 秒检查连接数，连续两次为 0 时触发程序退出
 
-### 26.4.12C (2026-04-12)
-- 新增：`--list-mailboxes` 参数，可直接列出 IMAP 目录与 flags
-- 优化：邮箱目录选择支持常见别名映射（如 `junk`、`垃圾邮件` 自动匹配 `\\Junk`）
-- 优化：当目录选择失败时，报错中附带可用目录列表，便于排查
-
-### 26.4.12B (2026-04-12)
-- 安全：仓库内 `config/OutLook.csv` 改为脱敏示例配置，避免提交真实凭证
-- 新增：支持默认优先读取 `config/OutLook.local.csv`（用于本地私有配置）
-- 新增：`.gitignore` 忽略本地 token 缓存、日志、临时目录与本地私有配置
-- 优化：`--dry-run` 输出默认脱敏展示 `email` 与 `client_id`
-
-### 26.4.12A (2026-04-12)
-- 重构：核心逻辑改为类结构，新增 `OutlookConfig` 与 `OutlookMailService`
-- 新增：从 `config/OutLook.csv` 自动读取邮箱配置，并支持按 `profile` 选择
-- 新增：CSV 字段自动尝试 URL-safe Base64 解码（兼容明文）
-- 新增：日志系统（控制台 + 可选文件输出），支持 `--log-level`、`--log-file`
-- 文档：同步更新运行参数、配置说明、示例
-
-### 26.4.11A (2026-04-11)
-- 新增：`main.py` 作为统一入口
-- 新增：`main.bat` 作为 Windows 启动脚本，并设置 `PYTHONIOENCODING=utf-8`
-- 新增：`tmp`、`db`、`config`、`log` 目录
-- 文档：按项目规则重写 `README.md`
+### 26.4.12E (2026-04-12)
+- 重构：`main.py` 拆分为双线程架构（服务端线程 + 客户端线程）
+- 新增：`server/websocket_server.py`，服务端基于 `aiohttp` 实现内部 WebSocket 与对外 HTTP 接口
+- 新增：`client/internal_ws_client.py`，客户端基于 `aiohttp` 首次登录获取 `cookie` 后周期上报账号与邮件数量
+- 新增：服务端使用线程安全队列维护客户端登录信息，并提供登录会话查询接口
