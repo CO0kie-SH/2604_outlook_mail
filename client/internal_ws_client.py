@@ -1,7 +1,11 @@
 import asyncio
+import csv
 from contextlib import suppress
 import json
+import re
 import threading
+import time
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -9,6 +13,7 @@ import aiohttp
 
 class InternalWSClient:
     """邮件模块 WebSocket 客户端，按 JSON-RPC 2.0 流程完成一次登录与查询。"""
+    RPC_TIMEOUT_SECONDS = 20
 
     def __init__(
         self,
@@ -100,12 +105,14 @@ class InternalWSClient:
                     method="outlook.token.acquire",
                     params={"cookie": cookie},
                 )
+                folders = token_resp.get("folders", [])
                 self.logger.info(
-                    "token_success=%s mailbox=%s inbox_total=%s",
+                    "token_success=%s folder_count=%s",
                     token_resp.get("success"),
-                    token_resp.get("mailbox"),
-                    token_resp.get("inbox_total"),
+                    len(folders) if isinstance(folders, list) else 0,
                 )
+                self.logger.info("folders=%s", self._format_folders_for_log(folders))
+                self._save_folders_to_csv(folders)
 
                 # 5) 首次拿到邮件数后退出登录，不再重复登录。
                 logout_resp = await self._rpc_call(
@@ -126,20 +133,34 @@ class InternalWSClient:
         method: str,
         params: dict[str, Any],
     ) -> dict[str, Any]:
+        request_unixtime_ms = int(time.time() * 1000)
         request = {
             "jsonrpc": "2.0",
             "id": rpc_id,
             "method": method,
             "params": params,
+            "unixtime_ms": request_unixtime_ms,
         }
         await ws.send_json(request)
-        msg = await ws.receive()
+        msg = await asyncio.wait_for(ws.receive(), timeout=self.RPC_TIMEOUT_SECONDS)
         if msg.type != aiohttp.WSMsgType.TEXT:
             raise RuntimeError(f"rpc response not text, method={method}")
 
         payload = json.loads(msg.data)
         if payload.get("jsonrpc") != "2.0" or payload.get("id") != rpc_id:
             raise RuntimeError(f"invalid rpc response: {payload}")
+
+        echo_request_ms = payload.get("request_unixtime_ms")
+        response_ms = payload.get("response_unixtime_ms")
+        if not isinstance(response_ms, int):
+            self.logger.warning("rpc response missing response_unixtime_ms, method=%s payload=%s", method, payload)
+        if echo_request_ms != request_unixtime_ms:
+            self.logger.warning(
+                "rpc request_unixtime_ms mismatch, method=%s sent=%s recv=%s",
+                method,
+                request_unixtime_ms,
+                echo_request_ms,
+            )
 
         if "error" in payload:
             error = payload.get("error", {})
@@ -149,3 +170,41 @@ class InternalWSClient:
         if not isinstance(result, dict):
             raise RuntimeError(f"rpc result must be object, method={method}")
         return result
+
+    @staticmethod
+    def _format_folders_for_log(folders: Any) -> list[dict[str, Any]]:
+        if not isinstance(folders, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for item in folders:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(
+                {
+                    "name": str(item.get("name", "")),
+                    "flags": [str(x) for x in item.get("flags", [])] if isinstance(item.get("flags", []), list) else [],
+                }
+            )
+        return normalized
+
+    def _save_folders_to_csv(self, folders: Any) -> None:
+        rows = sorted(self._format_folders_for_log(folders), key=lambda x: x.get("name", "").lower())
+        account = (self.account or "").strip()
+        local_part = account.split("@", 1)[0].strip() if account else ""
+        safe_prefix = re.sub(r"[\\/:*?\"<>|]", "_", local_part) or "mail"
+        output = Path("config") / f"{safe_prefix}_folders.csv"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        now_ms = int(time.time() * 1000)
+
+        with output.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["unixtime_ms", "name", "flags"])
+            writer.writeheader()
+            for item in rows:
+                writer.writerow(
+                    {
+                        "unixtime_ms": now_ms,
+                        "name": item["name"],
+                        "flags": json.dumps(item["flags"], ensure_ascii=False),
+                    }
+                )
+        self.logger.info("folders csv saved: %s", output.resolve())

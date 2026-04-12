@@ -18,8 +18,14 @@ import imap_outlook_oauth2
 class InternalWSServer:
     """邮件模块 WebSocket 服务端，使用 JSON-RPC 2.0 进行内部通信。"""
 
-    IDLE_CHECK_INTERVAL_SECONDS = 60
+    IDLE_CHECK_INTERVAL_SECONDS = 30
     IDLE_ZERO_LIMIT = 2
+    QUEUE_ACK_TIMEOUT_SECONDS = 3
+
+    RPC_METHOD_LOGIN = "auth.login"
+    RPC_METHOD_CONFIRM = "auth.confirm"
+    RPC_METHOD_ACQUIRE = "outlook.token.acquire"
+    RPC_METHOD_LOGOUT = "auth.logout"
 
     def __init__(self, host: str, port: int, logger):
         self.host = host
@@ -37,7 +43,7 @@ class InternalWSServer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._runner: web.AppRunner | None = None
 
-        # 安全队列：统一串行处理登录确认和 token 缓存等敏感会话操作。
+        # 安全队列：串行处理登录确认和 token 缓存等敏感会话动作。
         self._secure_queue: Queue[dict[str, Any]] = Queue()
         self._sessions: dict[str, dict[str, Any]] = {}
         self._session_lock = threading.Lock()
@@ -53,7 +59,7 @@ class InternalWSServer:
         self._consumer_thread = threading.Thread(target=self._consume_secure_queue, name="ws-secure-queue", daemon=True)
         self._consumer_thread.start()
 
-        # 每 60 秒检查一次客户端连接数，连续两次为 0 则触发退出。
+        # 每 30 秒检查一次客户端连接数，连续两次为 0 则退出。
         self._idle_checker_thread = threading.Thread(target=self._idle_exit_checker, name="ws-idle-checker", daemon=True)
         self._idle_checker_thread.start()
 
@@ -105,6 +111,7 @@ class InternalWSServer:
             time.sleep(self.IDLE_CHECK_INTERVAL_SECONDS)
             with self._clients_lock:
                 active = self._active_clients
+
             if active == 0:
                 zero_count += 1
                 self.logger.info("idle-check: active_clients=0, zero_count=%s", zero_count)
@@ -141,7 +148,7 @@ class InternalWSServer:
                         if session:
                             session["access_token"] = str(event.get("access_token", ""))
                             session["token_acquired_at"] = datetime.now(timezone.utc).isoformat()
-                            session["inbox_total"] = int(event.get("inbox_total", 0))
+                            session["folders"] = event.get("folders", [])
                 else:
                     self.logger.warning("unknown secure queue event: %s", event_type)
             finally:
@@ -162,10 +169,10 @@ class InternalWSServer:
                     params={
                         "module": "mail",
                         "methods": [
-                            "auth.login",
-                            "auth.confirm",
-                            "outlook.token.acquire",
-                            "auth.logout",
+                            self.RPC_METHOD_LOGIN,
+                            self.RPC_METHOD_CONFIRM,
+                            self.RPC_METHOD_ACQUIRE,
+                            self.RPC_METHOD_LOGOUT,
                         ],
                     },
                 )
@@ -182,7 +189,6 @@ class InternalWSServer:
                     current_cookie = new_cookie
                 if response is not None:
                     await ws.send_json(response)
-
         finally:
             if current_cookie:
                 self._delete_cookie_session(current_cookie, reason="ws_disconnected")
@@ -195,49 +201,52 @@ class InternalWSServer:
         try:
             rpc = json.loads(text)
         except json.JSONDecodeError:
-            return self._rpc_error(None, -32700, "Parse error"), None
+            return self._rpc_error(None, -32700, "Parse error", None), None
 
         if not isinstance(rpc, dict) or rpc.get("jsonrpc") != "2.0":
-            return self._rpc_error(rpc.get("id") if isinstance(rpc, dict) else None, -32600, "Invalid Request"), None
+            rpc_id = rpc.get("id") if isinstance(rpc, dict) else None
+            req_unixtime = self._normalize_unixtime_ms(rpc.get("unixtime_ms") if isinstance(rpc, dict) else None)
+            return self._rpc_error(rpc_id, -32600, "Invalid Request", req_unixtime), None
 
         rpc_id = rpc.get("id")
+        req_unixtime = self._normalize_unixtime_ms(rpc.get("unixtime_ms"))
         method = str(rpc.get("method", "")).strip()
         params = rpc.get("params", {})
         if not isinstance(params, dict):
-            return self._rpc_error(rpc_id, -32602, "Invalid params"), None
+            return self._rpc_error(rpc_id, -32602, "Invalid params", req_unixtime), None
 
-        if method == "auth.login":
+        if method == self.RPC_METHOD_LOGIN:
             result = self._rpc_auth_login(params)
             if "cookie" in result:
-                return self._rpc_result(rpc_id, result), str(result["cookie"])
-            return self._rpc_error(rpc_id, -32001, result.get("message", "login failed")), None
+                return self._rpc_result(rpc_id, result, req_unixtime), str(result["cookie"])
+            return self._rpc_error(rpc_id, -32001, result.get("message", "login failed"), req_unixtime), None
 
-        if method == "auth.confirm":
+        if method == self.RPC_METHOD_CONFIRM:
             cookie = str(params.get("cookie", "")).strip()
             if not cookie:
-                return self._rpc_error(rpc_id, -32602, "cookie required"), None
+                return self._rpc_error(rpc_id, -32602, "cookie required", req_unixtime), None
             ok, data = await asyncio.to_thread(self._confirm_login_via_queue, cookie)
             if not ok:
-                return self._rpc_error(rpc_id, -32003, data.get("message", "cookie invalid")), None
-            return self._rpc_result(rpc_id, data), cookie
+                return self._rpc_error(rpc_id, -32003, data.get("message", "cookie invalid"), req_unixtime), None
+            return self._rpc_result(rpc_id, data, req_unixtime), cookie
 
-        if method == "outlook.token.acquire":
+        if method == self.RPC_METHOD_ACQUIRE:
             cookie = str(params.get("cookie", "")).strip()
             if not cookie:
-                return self._rpc_error(rpc_id, -32602, "cookie required"), None
-            ok, data = await asyncio.to_thread(self._acquire_token_and_query_inbox, cookie)
+                return self._rpc_error(rpc_id, -32602, "cookie required", req_unixtime), None
+            ok, data = await asyncio.to_thread(self._acquire_token_and_fetch_folders, cookie)
             if not ok:
-                return self._rpc_error(rpc_id, -32004, data.get("message", "token acquire failed")), None
-            return self._rpc_result(rpc_id, data), cookie
+                return self._rpc_error(rpc_id, -32004, data.get("message", "token acquire failed"), req_unixtime), None
+            return self._rpc_result(rpc_id, data, req_unixtime), cookie
 
-        if method == "auth.logout":
+        if method == self.RPC_METHOD_LOGOUT:
             cookie = str(params.get("cookie", "")).strip() or current_cookie
             if not cookie:
-                return self._rpc_error(rpc_id, -32602, "cookie required"), None
+                return self._rpc_error(rpc_id, -32602, "cookie required", req_unixtime), None
             self._delete_cookie_session(cookie, reason="client_logout")
-            return self._rpc_result(rpc_id, {"success": True, "message": "logout success"}), ""
+            return self._rpc_result(rpc_id, {"success": True, "message": "logout success"}, req_unixtime), ""
 
-        return self._rpc_error(rpc_id, -32601, f"Method not found: {method}"), None
+        return self._rpc_error(rpc_id, -32601, f"Method not found: {method}", req_unixtime), None
 
     def _rpc_auth_login(self, params: dict[str, Any]) -> dict[str, Any]:
         account = str(params.get("account", "")).strip()
@@ -255,7 +264,7 @@ class InternalWSServer:
                 "confirmed": False,
                 "access_token": "",
                 "token_acquired_at": "",
-                "inbox_total": None,
+                "folders": [],
             }
         return {"success": True, "cookie": cookie, "login_at": login_at}
 
@@ -265,20 +274,19 @@ class InternalWSServer:
             if session is None:
                 return False, {"message": "invalid cookie"}
 
-        ack = threading.Event()
-        self._secure_queue.put({"type": "login_confirm", "cookie": cookie, "ack": ack})
-        ack.wait(timeout=3)
+        if not self._secure_queue_roundtrip({"type": "login_confirm", "cookie": cookie}):
+            return False, {"message": "secure queue timeout during login confirm"}
 
         return True, {
             "success": True,
             "cookie": cookie,
             "enabled_methods": [
-                "outlook.token.acquire",
-                "auth.logout",
+                self.RPC_METHOD_ACQUIRE,
+                self.RPC_METHOD_LOGOUT,
             ],
         }
 
-    def _acquire_token_and_query_inbox(self, cookie: str) -> tuple[bool, dict[str, Any]]:
+    def _acquire_token_and_fetch_folders(self, cookie: str) -> tuple[bool, dict[str, Any]]:
         with self._session_lock:
             session = self._sessions.get(cookie)
             if session is None:
@@ -297,36 +305,34 @@ class InternalWSServer:
                     else service.acquire_access_token()
                 )
 
-            inbox_total = self._fetch_inbox_total(service, access_token)
+            folders = self._fetch_mailbox_folders(service, access_token)
 
             if not token_from_cache:
-                ack = threading.Event()
-                self._secure_queue.put(
+                ok = self._secure_queue_roundtrip(
                     {
                         "type": "token_update",
                         "cookie": cookie,
                         "access_token": access_token,
-                        "inbox_total": inbox_total,
-                        "ack": ack,
+                        "folders": folders,
                     }
                 )
-                ack.wait(timeout=3)
+                if not ok:
+                    return False, {"message": "secure queue timeout during token update"}
             else:
                 with self._session_lock:
                     session = self._sessions.get(cookie)
                     if session:
-                        session["inbox_total"] = inbox_total
+                        session["folders"] = folders
 
             return True, {
                 "success": True,
                 "cookie": cookie,
                 "token_cached": token_from_cache,
                 "token_preview": self._mask_token(access_token),
-                "mailbox": "INBOX",
-                "inbox_total": inbox_total,
+                "folders": folders,
             }
         except Exception as exc:
-            self.logger.exception("outlook token/count handling failed")
+            self.logger.exception("outlook token/folders handling failed")
             return False, {"message": str(exc)}
 
     def _build_outlook_service(self) -> imap_outlook_oauth2.OutlookMailService:
@@ -338,21 +344,20 @@ class InternalWSServer:
         config = imap_outlook_oauth2.build_runtime_config(args)
         return imap_outlook_oauth2.OutlookMailService(config, self.logger)
 
-    def _fetch_inbox_total(self, service: imap_outlook_oauth2.OutlookMailService, access_token: str) -> int:
-        self.logger.info("query inbox total by token")
+    def _fetch_mailbox_folders(self, service: imap_outlook_oauth2.OutlookMailService, access_token: str) -> list[dict[str, Any]]:
+        self.logger.info("query mailbox folders by token")
         imap = imaplib.IMAP4_SSL(service.config.host, service.config.port)
         try:
             xoauth2 = service.build_xoauth2(service.config.email_addr, access_token)
             imap.authenticate("XOAUTH2", lambda _: xoauth2)
-            typ, _ = imap.select("INBOX")
-            if typ != "OK":
-                raise RuntimeError("select INBOX failed")
-            typ, data = imap.search(None, "ALL")
-            if typ != "OK":
-                raise RuntimeError("search INBOX failed")
-            if not data or not data[0]:
-                return 0
-            return len(data[0].split())
+            raw_folders = service.list_mailboxes(imap)
+            # 统一输出结构：每个文件夹仅包含 name 和 flags。
+            normalized: list[dict[str, Any]] = []
+            for item in raw_folders:
+                name = str(item.get("name", ""))
+                flags = [str(x) for x in item.get("flags", [])]
+                normalized.append({"name": name, "flags": flags})
+            return normalized
         finally:
             try:
                 imap.logout()
@@ -364,6 +369,16 @@ class InternalWSServer:
             removed = self._sessions.pop(cookie, None)
         if removed is not None:
             self.logger.info("cookie deleted: reason=%s", reason)
+
+    def _secure_queue_roundtrip(self, payload: dict[str, Any]) -> bool:
+        ack = threading.Event()
+        event = dict(payload)
+        event["ack"] = ack
+        self._secure_queue.put(event)
+        ok = ack.wait(timeout=self.QUEUE_ACK_TIMEOUT_SECONDS)
+        if not ok:
+            self.logger.warning("secure queue ack timeout: type=%s", payload.get("type"))
+        return ok
 
     def _mark_client_connected(self) -> None:
         with self._clients_lock:
@@ -382,13 +397,47 @@ class InternalWSServer:
         return f"{token[:6]}***{token[-4:]}"
 
     @staticmethod
-    def _rpc_result(rpc_id: Any, result: dict[str, Any]) -> dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
+    def _rpc_result(rpc_id: Any, result: dict[str, Any], request_unixtime_ms: int | None) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": result,
+            "request_unixtime_ms": request_unixtime_ms,
+            "response_unixtime_ms": InternalWSServer._now_ms(),
+        }
 
     @staticmethod
-    def _rpc_error(rpc_id: Any, code: int, message: str) -> dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
+    def _rpc_error(rpc_id: Any, code: int, message: str, request_unixtime_ms: int | None) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "error": {"code": code, "message": message},
+            "request_unixtime_ms": request_unixtime_ms,
+            "response_unixtime_ms": InternalWSServer._now_ms(),
+        }
 
     @staticmethod
     def _rpc_notification(method: str, params: dict[str, Any]) -> dict[str, Any]:
-        return {"jsonrpc": "2.0", "method": method, "params": params}
+        return {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "request_unixtime_ms": None,
+            "response_unixtime_ms": InternalWSServer._now_ms(),
+        }
+
+    @staticmethod
+    def _normalize_unixtime_ms(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            normalized = int(value)
+            if normalized < 0:
+                return None
+            return normalized
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)

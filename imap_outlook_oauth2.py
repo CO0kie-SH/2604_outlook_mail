@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import asyncio
 import base64
 import binascii
@@ -438,7 +438,7 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
     logger.propagate = False
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s [%(filename)s:%(lineno)d] - %(message)s")
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(fmt)
