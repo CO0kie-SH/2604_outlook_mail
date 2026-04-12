@@ -39,10 +39,12 @@ D:\0Code2\py312\python.exe -m pip install msal aiohttp
 ## 配置方式
 支持两种方式，环境变量优先级更高：
 1. 环境变量（可覆盖 CSV）
-2. `config/OutLook.csv`
+2. CSV 文件（优先读取 `config/OutLook.local.csv`，不存在时读取 `config/OutLook.csv`）
 
 ### CSV 配置格式
-文件：`config/OutLook.csv`
+推荐文件：
+- `config/OutLook.local.csv`（本地私有，不提交）
+- `config/OutLook.csv`（仓库示例）
 
 表头：
 ```csv
@@ -75,9 +77,10 @@ D:\0Code2\py312\python.exe -B main.py
 
 ## 命令参数
 - `--dry-run`：只检查配置，不连接网络
+- `--list-mailboxes`：列出邮箱目录，不读取邮件内容
 - `--mailbox`：邮箱目录（默认 `INBOX`）
 - `--profile`：CSV 中 `mail` 字段（默认 `outlook`）
-- `--config`：CSV 配置路径（默认 `config/OutLook.csv`）
+- `--config`：CSV 配置路径（默认：若存在 `config/OutLook.local.csv` 则优先使用，否则使用 `config/OutLook.csv`）
 - `--log-level`：日志等级（默认 `INFO`）
 - `--log-file`：日志文件路径（默认空，仅控制台）
 
@@ -97,15 +100,26 @@ D:\0Code2\py312\python.exe -B main.py --profile outlook --log-level INFO --log-f
 - `OUTLOOK_IMAP_MAILBOX`：可选，默认 `INBOX`
 - `OUTLOOK_TOKEN_CACHE`：可选，默认 `.outlook_token_cache.json`
 - `OUTLOOK_PROFILE`：可选，默认 `outlook`
-- `OUTLOOK_CONFIG_PATH`：可选，默认 `config/OutLook.csv`
+- `OUTLOOK_CONFIG_PATH`：可选；未设置时默认自动选择 `config/OutLook.local.csv` 或 `config/OutLook.csv`
 - `OUTLOOK_LOG_LEVEL`：可选，默认 `INFO`
 - `OUTLOOK_LOG_FILE`：可选，默认空
 
 ## 版本
-当前版本：`26.4.12A`
+当前版本：`26.4.12C`
 最后更新：`2026-04-12`
 
 ## 更新日志
+### 26.4.12C (2026-04-12)
+- 新增：`--list-mailboxes` 参数，可直接列出 IMAP 目录与 flags
+- 优化：邮箱目录选择支持常见别名映射（如 `junk`、`垃圾邮件` 自动匹配 `\\Junk`）
+- 优化：当目录选择失败时，报错中附带可用目录列表，便于排查
+
+### 26.4.12B (2026-04-12)
+- 安全：仓库内 `config/OutLook.csv` 改为脱敏示例配置，避免提交真实凭证
+- 新增：支持默认优先读取 `config/OutLook.local.csv`（用于本地私有配置）
+- 新增：`.gitignore` 忽略本地 token 缓存、日志、临时目录与本地私有配置
+- 优化：`--dry-run` 输出默认脱敏展示 `email` 与 `client_id`
+
 ### 26.4.12A (2026-04-12)
 - 重构：核心逻辑改为类结构，新增 `OutlookConfig` 与 `OutlookMailService`
 - 新增：从 `config/OutLook.csv` 自动读取邮箱配置，并支持按 `profile` 选择

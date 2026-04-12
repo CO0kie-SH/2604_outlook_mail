@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.idea/
+
+# Local runtime artifacts
+.outlook_token_cache.json
+log/
+tmp/
+db/
+
+# Local secrets/config
+config/OutLook.local.csv

@@ -6,7 +6,6 @@
 @set path=D:\0Code2\py312;%path%
 @set path=D:\job\py312\Scripts;D:\job\py312;%path%
 
-set fei_title="播报标题"
-:: set "only_work=Workday"
+set fei_title="Outlook IMAP OAuth2 收取邮件"
 
 python main.py %*

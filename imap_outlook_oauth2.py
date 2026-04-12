@@ -61,7 +61,13 @@ class OutlookMailService:
 
         try:
             decoded = cls.safe_base64_decode(raw.encode("utf-8"))
-            return decoded.decode("utf-8", errors="replace").strip()
+            text = decoded.decode("utf-8").strip()
+            if not text:
+                return raw
+            # 只接受可打印文本，避免把普通明文误判为 Base64 后得到乱码。
+            if not all(ch.isprintable() or ch in "\r\n\t" for ch in text):
+                return raw
+            return text
         except (binascii.Error, ValueError):
             return raw
 
@@ -108,6 +114,59 @@ class OutlookMailService:
     @staticmethod
     def build_xoauth2(user: str, access_token: str) -> bytes:
         return f"user={user}\x01auth=Bearer {access_token}\x01\x01".encode("utf-8")
+
+    @staticmethod
+    def parse_list_line(line: bytes) -> tuple[list[str], str]:
+        raw = (line or b"").decode("utf-8", errors="replace").strip()
+        # 典型格式: (\HasNoChildren \Junk) "/" Junk
+        m = re.match(r"^\((?P<flags>[^)]*)\)\s+\"[^\"]*\"\s+(?P<name>.+)$", raw)
+        if not m:
+            return [], raw
+        flags = [f for f in m.group("flags").split() if f]
+        name = m.group("name").strip()
+        if name.startswith('"') and name.endswith('"') and len(name) >= 2:
+            name = name[1:-1]
+        return flags, name
+
+    def list_mailboxes(self, imap) -> list[dict[str, object]]:
+        typ, data = imap.list()
+        if typ != "OK" or data is None:
+            return []
+        result = []
+        for line in data:
+            flags, name = self.parse_list_line(line)
+            result.append({"name": name, "flags": flags})
+        return result
+
+    def resolve_mailbox_name(self, imap, requested_mailbox: str) -> tuple[str, list[dict[str, object]]]:
+        mailboxes = self.list_mailboxes(imap)
+        requested = (requested_mailbox or "").strip()
+        if not requested:
+            return "INBOX", mailboxes
+
+        for item in mailboxes:
+            name = str(item.get("name", ""))
+            if requested.lower() == name.lower():
+                return name, mailboxes
+
+        alias_to_flag = {
+            "junk": r"\Junk",
+            "junk email": r"\Junk",
+            "spam": r"\Junk",
+            "垃圾邮箱": r"\Junk",
+            "垃圾邮件": r"\Junk",
+            "trash": r"\Trash",
+            "deleted": r"\Trash",
+            "已删除": r"\Trash",
+            "删除邮件": r"\Trash",
+        }
+        wanted_flag = alias_to_flag.get(requested.lower())
+        if wanted_flag:
+            for item in mailboxes:
+                flags = [str(x) for x in item.get("flags", [])]
+                if wanted_flag in flags:
+                    return str(item.get("name", requested_mailbox)), mailboxes
+        return requested_mailbox, mailboxes
 
     def get_public_client_app(self):
         token_cache = msal.SerializableTokenCache()
@@ -226,9 +285,13 @@ class OutlookMailService:
             imap.authenticate("XOAUTH2", lambda _: xoauth2)
             self.logger.info("IMAP 认证成功")
 
-            typ, _ = imap.select(self.config.mailbox)
+            mailbox_name, known_mailboxes = self.resolve_mailbox_name(imap, self.config.mailbox)
+            typ, _ = imap.select(mailbox_name)
             if typ != "OK":
-                raise RuntimeError(f"无法选择邮箱目录: {self.config.mailbox}")
+                names = [str(x.get("name", "")) for x in known_mailboxes]
+                raise RuntimeError(
+                    f"无法选择邮箱目录: {self.config.mailbox} (解析后: {mailbox_name})。可用目录: {', '.join(names)}"
+                )
 
             typ, data = imap.search(None, "ALL")
             if typ != "OK":
@@ -269,6 +332,26 @@ class OutlookMailService:
             except Exception:
                 self.logger.debug("IMAP 登出时忽略异常", exc_info=True)
 
+    def get_mailboxes(self):
+        self.logger.info("开始连接 IMAP: %s:%s", self.config.host, self.config.port)
+        imap = imaplib.IMAP4_SSL(self.config.host, self.config.port)
+        try:
+            token = (
+                self.acquire_access_token_by_refresh_token()
+                if self.config.refresh_token
+                else self.acquire_access_token()
+            )
+            xoauth2 = self.build_xoauth2(self.config.email_addr, token)
+            imap.authenticate("XOAUTH2", lambda _: xoauth2)
+            self.logger.info("IMAP 认证成功")
+            return self.list_mailboxes(imap)
+        finally:
+            try:
+                imap.logout()
+                self.logger.info("IMAP 连接已关闭")
+            except Exception:
+                self.logger.debug("IMAP 登出时忽略异常", exc_info=True)
+
 
 def build_runtime_config(args) -> OutlookConfig:
     csv_config_path = Path(args.config)
@@ -299,6 +382,36 @@ def build_runtime_config(args) -> OutlookConfig:
     )
 
 
+def resolve_default_config_path() -> str:
+    config_from_env = os.getenv("OUTLOOK_CONFIG_PATH", "").strip()
+    if config_from_env:
+        return config_from_env
+
+    local_config = Path("config/OutLook.local.csv")
+    if local_config.exists():
+        return str(local_config)
+    return "config/OutLook.csv"
+
+
+def mask_email(value: str) -> str:
+    if not value or "@" not in value:
+        return "***"
+    local, _, domain = value.partition("@")
+    if len(local) <= 2:
+        safe_local = local[:1] + "*"
+    else:
+        safe_local = local[:2] + "*" * (len(local) - 2)
+    return f"{safe_local}@{domain}"
+
+
+def mask_secret(value: str, keep_start: int = 4, keep_end: int = 4) -> str:
+    if not value:
+        return "***"
+    if len(value) <= keep_start + keep_end:
+        return "*" * len(value)
+    return f"{value[:keep_start]}***{value[-keep_end:]}"
+
+
 def setup_logger(level: str, log_file: str) -> logging.Logger:
     logger = logging.getLogger("outlook_mail")
     logger.handlers.clear()
@@ -323,11 +436,12 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Outlook IMAP OAuth2 收取未读邮件示例")
     parser.add_argument("--dry-run", action="store_true", help="只检查配置，不连接网络")
+    parser.add_argument("--list-mailboxes", action="store_true", help="列出邮箱目录，不读取邮件内容")
     parser.add_argument("--mailbox", default=os.getenv("OUTLOOK_IMAP_MAILBOX", "INBOX"))
     parser.add_argument("--profile", default=os.getenv("OUTLOOK_PROFILE", "outlook"), help="CSV 配置中的 mail 字段")
     parser.add_argument(
         "--config",
-        default=os.getenv("OUTLOOK_CONFIG_PATH", "config/OutLook.csv"),
+        default=resolve_default_config_path(),
         help="Outlook CSV 配置文件路径",
     )
     parser.add_argument("--log-level", default=os.getenv("OUTLOOK_LOG_LEVEL", "INFO"), help="日志级别")
@@ -345,8 +459,8 @@ def main() -> int:
 
     if args.dry_run:
         print("配置检查通过:")
-        print(f"  email={config.email_addr}")
-        print(f"  client_id={config.client_id}")
+        print(f"  email={mask_email(config.email_addr)}")
+        print(f"  client_id={mask_secret(config.client_id)}")
         print(f"  tenant={config.tenant}")
         print(f"  host={config.host}:{config.port}")
         print(f"  mailbox={config.mailbox}")
@@ -355,6 +469,15 @@ def main() -> int:
         print(f"  profile={config.profile}")
         print(f"  auth_mode={'refresh_token' if config.refresh_token else 'device_flow_or_cache'}")
         logger.info("dry-run 完成")
+        return 0
+
+    if args.list_mailboxes:
+        boxes = service.get_mailboxes()
+        print("邮箱目录列表:")
+        for item in boxes:
+            name = item.get("name", "")
+            flags = " ".join(item.get("flags", []))
+            print(f"- {name}  [{flags}]")
         return 0
 
     result = service.fetch_all_mails()
