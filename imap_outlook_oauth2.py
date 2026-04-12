@@ -10,8 +10,10 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from email.header import decode_header
+from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
 
@@ -110,6 +112,39 @@ class OutlookMailService:
             else:
                 out.append(text)
         return "".join(out)
+
+    @staticmethod
+    def parse_message_date(value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return "(未知时间)"
+        try:
+            dt = parsedate_to_datetime(raw)
+            if dt is None:
+                return raw
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return dt.strftime("%Y-%m-%d %H:%M:%S %z")
+        except Exception:
+            return raw
+
+    def parse_fetched_mail(self, msg_id: bytes, typ, msg_data) -> dict[str, str]:
+        if typ != "OK" or not msg_data or not msg_data[0] or not msg_data[0][1]:
+            return {
+                "id": msg_id.decode("ascii", errors="ignore"),
+                "received_at": "(未知时间)",
+                "subject": "(读取失败)",
+                "body": "",
+            }
+
+        raw_message = msg_data[0][1] or b""
+        msg = email.message_from_bytes(raw_message)
+        return {
+            "id": msg_id.decode("ascii", errors="ignore"),
+            "received_at": self.parse_message_date(msg.get("Date", "")),
+            "subject": self.decode_mime_words(msg.get("Subject", "")) or "(无主题)",
+            "body": self.extract_body_text(msg) or "(无可读正文)",
+        }
 
     @staticmethod
     def build_xoauth2(user: str, access_token: str) -> bytes:
@@ -305,22 +340,7 @@ class OutlookMailService:
             mails = []
             for idx, msg_id in enumerate(msg_ids, start=1):
                 typ, msg_data = imap.fetch(msg_id, "(BODY.PEEK[])")
-                if typ != "OK" or not msg_data or not msg_data[0] or not msg_data[0][1]:
-                    subject = "(读取失败)"
-                    body = ""
-                else:
-                    raw_message = msg_data[0][1] or b""
-                    msg = email.message_from_bytes(raw_message)
-                    subject = self.decode_mime_words(msg.get("Subject", "")) or "(无主题)"
-                    body = self.extract_body_text(msg) or "(无可读正文)"
-
-                mails.append(
-                    {
-                        "id": msg_id.decode("ascii", errors="ignore"),
-                        "subject": subject,
-                        "body": body,
-                    }
-                )
+                mails.append(self.parse_fetched_mail(msg_id, typ, msg_data))
                 self.logger.debug("已读取邮件 %s/%s: id=%s", idx, len(msg_ids), mails[-1]["id"])
 
             self.logger.info("读取完成，共 %s 封", len(msg_ids))
@@ -415,6 +435,7 @@ def mask_secret(value: str, keep_start: int = 4, keep_end: int = 4) -> str:
 def setup_logger(level: str, log_file: str) -> logging.Logger:
     logger = logging.getLogger("outlook_mail")
     logger.handlers.clear()
+    logger.propagate = False
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
@@ -433,7 +454,38 @@ def setup_logger(level: str, log_file: str) -> logging.Logger:
     return logger
 
 
-def main() -> int:
+def resolve_default_log_file() -> str:
+    log_from_env = os.getenv("OUTLOOK_LOG_FILE", "").strip()
+    if log_from_env:
+        return log_from_env
+    return str(Path("log") / f"{datetime.now().strftime('%Y%m%d')}.log")
+
+
+def cleanup_old_logs(log_file: str, retention_days: int, logger: logging.Logger) -> None:
+    if not log_file or retention_days <= 0:
+        return
+
+    log_dir = Path(log_file).parent
+    if not log_dir.exists():
+        return
+
+    cutoff_date = (datetime.now() - timedelta(days=retention_days)).date()
+    for path in log_dir.glob("*.log"):
+        if not re.fullmatch(r"\d{8}\.log", path.name):
+            continue
+        try:
+            file_date = datetime.strptime(path.stem, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff_date:
+            try:
+                path.unlink()
+                logger.info("已清理过期日志: %s", path)
+            except OSError:
+                logger.warning("清理过期日志失败: %s", path, exc_info=True)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Outlook IMAP OAuth2 收取未读邮件示例")
     parser.add_argument("--dry-run", action="store_true", help="只检查配置，不连接网络")
     parser.add_argument("--list-mailboxes", action="store_true", help="列出邮箱目录，不读取邮件内容")
@@ -445,10 +497,17 @@ def main() -> int:
         help="Outlook CSV 配置文件路径",
     )
     parser.add_argument("--log-level", default=os.getenv("OUTLOOK_LOG_LEVEL", "INFO"), help="日志级别")
-    parser.add_argument("--log-file", default=os.getenv("OUTLOOK_LOG_FILE", ""), help="日志文件路径")
-    args = parser.parse_args()
+    parser.add_argument("--log-file", default=resolve_default_log_file(), help="日志文件路径")
+    parser.add_argument(
+        "--log-retention-days",
+        type=int,
+        default=int(os.getenv("OUTLOOK_LOG_RETENTION_DAYS", "30")),
+        help="日志保留天数（默认 30 天）",
+    )
+    return parser
 
-    logger = setup_logger(args.log_level, args.log_file)
+
+def run_with_args(args, logger: logging.Logger) -> int:
 
     if msal is None:
         print("缺少依赖 msal/aiohttp，请先执行: D:\\0Code2\\py312\\python.exe -m pip install msal aiohttp", file=sys.stderr)
@@ -467,6 +526,8 @@ def main() -> int:
         print(f"  cache={config.cache_path.resolve()}")
         print(f"  config={config.csv_config_path.resolve()}")
         print(f"  profile={config.profile}")
+        print(f"  log_file={Path(args.log_file).resolve()}")
+        print(f"  log_retention_days={args.log_retention_days}")
         print(f"  auth_mode={'refresh_token' if config.refresh_token else 'device_flow_or_cache'}")
         logger.info("dry-run 完成")
         return 0
@@ -488,10 +549,28 @@ def main() -> int:
     print("邮件内容列表:")
     for item in result["mails"]:
         print(f"\nID: {item['id']}")
+        print(f"时间: {item.get('received_at', '(未知时间)')}")
         print(f"标题: {item['subject']}")
         print("正文:")
         print(item["body"])
+        logger.info(
+            "邮件详情 id=%s 时间=%s 标题=%s",
+            item["id"],
+            item.get("received_at", "(未知时间)"),
+            item["subject"],
+        )
     return 0
+
+
+def main(parsed_args=None, logger: logging.Logger | None = None) -> int:
+    parser = build_arg_parser()
+    args = parsed_args if parsed_args is not None else parser.parse_args()
+    if logger is None:
+        active_logger = setup_logger(args.log_level, args.log_file)
+        cleanup_old_logs(args.log_file, args.log_retention_days, active_logger)
+    else:
+        active_logger = logger
+    return run_with_args(args, active_logger)
 
 
 if __name__ == "__main__":

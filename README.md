@@ -6,10 +6,10 @@
 - OAuth2 登录（优先 `refresh_token`，兜底设备码）
 - 连接 Outlook IMAP（`outlook.office365.com:993`）
 - 读取指定邮箱目录（默认 `INBOX`）
-- 输出邮件总数、每封邮件标题与正文
+- 输出邮件总数、每封邮件时间/标题/正文
 - 兼容 `text/plain` 与 `text/html`（HTML 自动转文本）
 - 支持从 `config/OutLook.csv` 读取账号配置
-- 支持日志等级与日志文件输出
+- 支持日志等级、按天日志文件与过期日志清理
 - 代码采用类结构（`OutlookMailService`）
 
 ## 项目结构
@@ -82,7 +82,8 @@ D:\0Code2\py312\python.exe -B main.py
 - `--profile`：CSV 中 `mail` 字段（默认 `outlook`）
 - `--config`：CSV 配置路径（默认：若存在 `config/OutLook.local.csv` 则优先使用，否则使用 `config/OutLook.csv`）
 - `--log-level`：日志等级（默认 `INFO`）
-- `--log-file`：日志文件路径（默认空，仅控制台）
+- `--log-file`：日志文件路径（默认 `log/YYYYMMDD.log`）
+- `--log-retention-days`：日志保留天数（默认 `30`）
 
 示例：
 ```powershell
@@ -102,13 +103,20 @@ D:\0Code2\py312\python.exe -B main.py --profile outlook --log-level INFO --log-f
 - `OUTLOOK_PROFILE`：可选，默认 `outlook`
 - `OUTLOOK_CONFIG_PATH`：可选；未设置时默认自动选择 `config/OutLook.local.csv` 或 `config/OutLook.csv`
 - `OUTLOOK_LOG_LEVEL`：可选，默认 `INFO`
-- `OUTLOOK_LOG_FILE`：可选，默认空
+- `OUTLOOK_LOG_FILE`：可选，默认 `log/YYYYMMDD.log`
+- `OUTLOOK_LOG_RETENTION_DAYS`：可选，默认 `30`
 
 ## 版本
-当前版本：`26.4.12C`
+当前版本：`26.4.12D`
 最后更新：`2026-04-12`
 
 ## 更新日志
+### 26.4.12D (2026-04-12)
+- 新增：默认日志路径改为 `log/YYYYMMDD.log`，并支持 `--log-retention-days` 自动清理过期日志
+- 新增：`main.py` 统一初始化 logger，并在启动时打印运行目录、项目目录、日志目录、解释器路径
+- 新增：邮件输出与日志记录均包含时间戳字段（基于邮件 `Date` 头）
+- 优化：提取单封邮件解析逻辑，减少 `fetch_all_mails` 内重复分支代码，提升可维护性
+
 ### 26.4.12C (2026-04-12)
 - 新增：`--list-mailboxes` 参数，可直接列出 IMAP 目录与 flags
 - 优化：邮箱目录选择支持常见别名映射（如 `junk`、`垃圾邮件` 自动匹配 `\\Junk`）
