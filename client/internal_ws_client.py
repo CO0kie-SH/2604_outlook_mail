@@ -11,6 +11,8 @@ from typing import Any
 
 import aiohttp
 
+from feishu_notifier import send_feishu_message
+
 
 class InternalWSClient:
     """邮件模块 WebSocket 客户端，按 JSON-RPC 2.0 流程完成一次登录与查询。"""
@@ -33,6 +35,9 @@ class InternalWSClient:
         "received_unixtime_ms",
         "unixtime_ms",
     ]
+    FEISHU_TITLE_LIMIT = 20
+    FEISHU_PER_FOLDER_LIMIT = 5
+    FEISHU_BODY_MAX_CHARS = 3500
 
     def __init__(
         self,
@@ -256,6 +261,7 @@ class InternalWSClient:
         return result
 
     async def _sync_mode_num_counts(self, ws: aiohttp.ClientWebSocketResponse, cookie: str, csv_path: Path) -> None:
+        pending_notifications: list[dict[str, Any]] = []
         self._set_file_writable(csv_path)
         try:
             with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -318,6 +324,13 @@ class InternalWSClient:
                     if title_result.get("success"):
                         titles = title_result.get("titles", [])
                         self._save_titles_to_csv(folder_name, titles, online_count)
+                        pending_notifications.append(
+                            self._build_title_notification_item(
+                                folder_name=folder_name,
+                                titles=titles,
+                                expected_count=online_count,
+                            )
+                        )
                         self.logger.info(
                             "folder titles synced: folder=%s title_count=%s expected_count=%s",
                             folder_name,
@@ -336,6 +349,8 @@ class InternalWSClient:
         finally:
             self._set_file_readonly(csv_path)
         self.logger.info("folders csv synced by mode=num/title: %s", csv_path)
+        if pending_notifications:
+            await self._send_title_notifications_batch(pending_notifications)
 
     def _save_titles_to_csv(self, folder_name: str, titles: Any, expected_count: int) -> None:
         account = (self.account or "").strip()
@@ -390,6 +405,81 @@ class InternalWSClient:
             sender_missing,
         )
         self.logger.info("title csv saved: %s", output.resolve())
+
+    def _build_title_notification_item(self, folder_name: str, titles: Any, expected_count: int) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        if isinstance(titles, list):
+            for item in titles:
+                if not isinstance(item, dict):
+                    continue
+                received_ms = int(item.get("received_unixtime_ms", 0) or 0)
+                rows.append(
+                    {
+                        "title": str(item.get("title", "")).strip() or "(无主题)",
+                        "sender": str(item.get("sender", "")).strip() or "(未知发件人)",
+                        "received_at": str(item.get("received_at", "")).strip() or "(未知时间)",
+                        "received_unixtime_ms": received_ms,
+                    }
+                )
+
+        rows.sort(key=lambda x: x["received_unixtime_ms"], reverse=True)
+        return {
+            "folder_name": folder_name,
+            "expected_count": expected_count,
+            "total_count": len(rows),
+            "rows": rows[: self.FEISHU_TITLE_LIMIT],
+        }
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        clean = " ".join((text or "").split())
+        if len(clean) <= limit:
+            return clean
+        return f"{clean[:limit]}..."
+
+    async def _send_title_notifications_batch(self, notifications: list[dict[str, Any]]) -> None:
+        if not notifications:
+            return
+
+        lines: list[str] = [
+            f"账号: {self.account}",
+            f"本轮同步文件夹: {len(notifications)}",
+            "",
+        ]
+
+        for item in notifications:
+            folder_name = str(item.get("folder_name", ""))
+            expected_count = int(item.get("expected_count", 0))
+            total_count = int(item.get("total_count", 0))
+            rows = item.get("rows", [])
+            rows = rows if isinstance(rows, list) else []
+            lines.append(f"【{folder_name}】在线数量: {expected_count} | 抓取数量: {total_count}")
+            show_rows = rows[: self.FEISHU_PER_FOLDER_LIMIT]
+            for idx, row in enumerate(show_rows, start=1):
+                sender = self._truncate_text(str(row.get("sender", "(未知发件人)")), 30)
+                subject = self._truncate_text(str(row.get("title", "(无主题)")), 80)
+                received_at = str(row.get("received_at", "(未知时间)"))
+                lines.append(f"{idx}. [{received_at}] {sender} | {subject}")
+            if total_count > self.FEISHU_PER_FOLDER_LIMIT:
+                lines.append(f"... 其余 {total_count - self.FEISHU_PER_FOLDER_LIMIT} 封省略")
+            lines.append("")
+
+        body = "\n".join(lines).strip()
+        if len(body) > self.FEISHU_BODY_MAX_CHARS:
+            body = f"{body[: self.FEISHU_BODY_MAX_CHARS - 16]}\n...内容已截断"
+
+        title = f"Outlook标题抓取更新/{self.account}"
+        try:
+            results = await send_feishu_message(self.logger, body, v_title=title)
+            success_count = sum(1 for ok in results.values() if ok)
+            self.logger.info(
+                "feishu title notify sent: folders=%s targets=%s success=%s",
+                len(notifications),
+                len(results),
+                success_count,
+            )
+        except Exception:
+            self.logger.exception("send feishu title notification failed")
 
     def _set_file_writable(self, path: Path) -> None:
         if not path.exists():
