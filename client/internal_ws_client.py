@@ -1,7 +1,8 @@
-﻿import asyncio
+import asyncio
 import csv
 from contextlib import suppress
 import json
+import os
 import re
 import stat
 import threading
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+
+import imap_outlook_oauth2
+from public.sqlite_ops import Base64ASqliteStore
 
 
 class InternalWSClient:
@@ -39,7 +43,7 @@ class InternalWSClient:
         "received_at",
         "received_unixtime_ms",
         "unixtime_ms",
-        "Base64A",
+        "Base64A_MD5",
     ]
     FEISHU_TITLE_LIMIT = 20
     FEISHU_PER_FOLDER_LIMIT = 5
@@ -64,6 +68,18 @@ class InternalWSClient:
         self._stop_event = threading.Event()
         self._force_logout_requested = False
         self._logged_out = False
+        self._provider_name = self._resolve_provider_name()
+        self._base64a_table_name = self._resolve_base64a_table_name()
+        self._base64a_store = Base64ASqliteStore(
+            self._base64a_db_path(),
+            table_name=self._base64a_table_name,
+        )
+        self.logger.info(
+            "base64a store configured: provider=%s db=%s table=%s",
+            self._provider_name,
+            self._base64a_db_path(),
+            self._base64a_table_name,
+        )
         self._ensure_csv_field_limit()
 
     @property
@@ -460,7 +476,7 @@ class InternalWSClient:
 
     def _folders_csv_path(self) -> Path:
         safe_prefix = self._account_file_prefix()
-        return Path("result") / f"{safe_prefix}_folders.csv"
+        return Path("db") / f"{safe_prefix}_folders.csv"
 
     def _account_file_prefix(self) -> str:
         account = (self.account or "").strip()
@@ -469,7 +485,7 @@ class InternalWSClient:
     def _title_csv_path(self, folder_name: str) -> Path:
         safe_prefix = self._account_file_prefix()
         safe_folder = re.sub(r"[\\/:*?\"<>|]", "_", folder_name.strip()) or "folder"
-        return Path("result") / f"{safe_prefix}_{safe_folder}.csv"
+        return Path("db") / f"{safe_prefix}_{safe_folder}.csv"
 
     def _load_local_folder_rows(self) -> tuple[list[dict[str, str]], Path]:
         csv_path = self._folders_csv_path().resolve()
@@ -581,6 +597,19 @@ class InternalWSClient:
                     local_count = len(existing_title_rows)
                     known_max_uid = self._extract_known_max_uid(existing_title_rows)
                     incremental_count = max(0, online_count - local_count)
+                    if mode == "base64a":
+                        db_missing = not self._base64a_store.db_path.exists()
+                        table_missing = not self._base64a_store.table_exists()
+                        if (db_missing or table_missing) and online_count > 0:
+                            self.logger.warning(
+                                "base64a store missing, force full pull: db_missing=%s table_missing=%s folder=%s online_count=%s",
+                                db_missing,
+                                table_missing,
+                                folder_name,
+                                online_count,
+                            )
+                            known_max_uid = None
+                            incremental_count = online_count
                     self.logger.info(
                         "title incremental plan: folder=%s mode=%s online_count=%s local_count=%s known_max_uid=%s incremental_count=%s",
                         folder_name,
@@ -593,7 +622,7 @@ class InternalWSClient:
                     if incremental_count <= 0:
                         if local_count > online_count:
                             # Online count reduced (e.g. deleted/moved mails), trim local CSV to stay consistent.
-                            trimmed_count = self._save_titles_to_csv(
+                            trimmed_count = await self._save_titles_to_csv(
                                 folder_name=folder_name,
                                 titles=[],
                                 expected_count=online_count,
@@ -633,7 +662,7 @@ class InternalWSClient:
                     if title_result.get("success"):
                         titles = title_result.get("titles", [])
                         t_title_save_start = time.perf_counter()
-                        merged_count = self._save_titles_to_csv(
+                        merged_count = await self._save_titles_to_csv(
                             folder_name=folder_name,
                             titles=titles,
                             expected_count=online_count,
@@ -684,7 +713,7 @@ class InternalWSClient:
         if pending_notifications:
             await self._send_title_notifications_batch(ws, cookie, pending_notifications)
 
-    def _save_titles_to_csv(
+    async def _save_titles_to_csv(
         self,
         folder_name: str,
         titles: Any,
@@ -699,11 +728,15 @@ class InternalWSClient:
         if merge_existing:
             rows.extend(existing_rows if existing_rows is not None else self._load_existing_title_rows_for_merge(folder_name))
 
+        existing_base64a_md5_by_key = await self._store_existing_rows_base64a(folder_name, rows)
+        incoming_base64a_md5_by_key = await self._store_incoming_titles_base64a(folder_name, titles)
+
         now_ms = int(time.time() * 1000)
         if isinstance(titles, list):
             for item in titles:
                 if not isinstance(item, dict):
                     continue
+                row_key = self._title_item_key(item)
                 rows.append(
                     {
                         "unixtime_ms": now_ms,
@@ -714,13 +747,16 @@ class InternalWSClient:
                         "sender": str(item.get("sender", "")),
                         "received_at": str(item.get("received_at", "")),
                         "received_unixtime_ms": int(item.get("received_unixtime_ms", 0) or 0),
-                        "Base64A": str(item.get("Base64A", "") or ""),
+                        "Base64A_MD5": incoming_base64a_md5_by_key.get(row_key, ""),
                     }
                 )
 
         merged_by_key: dict[str, dict[str, Any]] = {}
         for row in rows:
-            merged_by_key[self._title_row_key(row)] = row
+            row_key = self._title_row_key(row)
+            if not str(row.get("Base64A_MD5", "")).strip():
+                row["Base64A_MD5"] = existing_base64a_md5_by_key.get(row_key, "")
+            merged_by_key[row_key] = row
         rows = list(merged_by_key.values())
         rows.sort(
             key=lambda x: (
@@ -751,6 +787,100 @@ class InternalWSClient:
         self.logger.info("title csv saved: %s", output.resolve())
         return len(rows)
 
+    async def _store_existing_rows_base64a(
+        self,
+        folder_name: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        if not rows:
+            return {}
+        return await self._upsert_base64a_records(folder_name=folder_name, records=rows, from_existing_rows=True)
+
+    async def _store_incoming_titles_base64a(
+        self,
+        folder_name: str,
+        titles: Any,
+    ) -> dict[str, str]:
+        if not isinstance(titles, list) or not titles:
+            return {}
+        records = [item for item in titles if isinstance(item, dict)]
+        if not records:
+            return {}
+        return await self._upsert_base64a_records(folder_name=folder_name, records=records, from_existing_rows=False)
+
+    async def _upsert_base64a_records(
+        self,
+        folder_name: str,
+        records: list[dict[str, Any]],
+        from_existing_rows: bool,
+    ) -> dict[str, str]:
+        base64a_md5_by_key: dict[str, str] = {}
+        mapped_records: list[dict[str, Any]] = []
+        row_key_by_message_id: dict[str, str] = {}
+
+        for record in records:
+            message_id = str(record.get("message_id", "")).strip()
+            if not message_id:
+                continue
+
+            if from_existing_rows:
+                row_key = self._title_row_key(record)
+            else:
+                row_key = self._title_item_key(record)
+            if not row_key:
+                continue
+
+            row_key_by_message_id[message_id] = row_key
+            mapped_records.append(record)
+
+        if not mapped_records:
+            return {}
+
+        md5_by_message_id = await self._base64a_store.upsert_records(
+            account=self.account,
+            folder_name=folder_name,
+            records=mapped_records,
+        )
+
+        for message_id, md5_value in md5_by_message_id.items():
+            row_key = row_key_by_message_id.get(message_id, "")
+            if row_key:
+                base64a_md5_by_key[row_key] = md5_value
+        return base64a_md5_by_key
+
+    def _base64a_db_path(self) -> Path:
+        provider = Base64ASqliteStore.normalize_identifier(self._provider_name, fallback="outlook").lower()
+        return Path("db") / f"{provider}.db"
+
+    def _resolve_provider_name(self) -> str:
+        profile = os.getenv("OUTLOOK_PROFILE", "outlook").strip() or "outlook"
+        try:
+            config_path = Path(imap_outlook_oauth2.resolve_default_config_path())
+            row = imap_outlook_oauth2.OutlookMailService.load_outlook_config(config_path, profile)
+            provider = str(row.get("mail", "")).strip()
+            if provider:
+                return provider
+        except Exception:
+            self.logger.warning("resolve provider name failed, fallback to profile", exc_info=True)
+        return profile
+
+    def _resolve_base64a_table_name(self) -> str:
+        return Base64ASqliteStore.build_account_table_name(self.account)
+
+
+    @staticmethod
+    def _title_item_key(item: dict[str, Any]) -> str:
+        uid = str(item.get("uid", "")).strip()
+        if uid:
+            return f"uid:{uid}"
+        message_id = str(item.get("message_id", "")).strip()
+        if message_id:
+            return f"message_id:{message_id}"
+        mail_id = str(item.get("mail_id", "")).strip()
+        if mail_id:
+            return f"mail_id:{mail_id}"
+        return f"fallback:{str(item.get('received_at', '')).strip()}|{str(item.get('title', '')).strip()}"
+
     def _load_existing_title_rows_for_merge(self, folder_name: str) -> list[dict[str, Any]]:
         output = self._title_csv_path(folder_name)
         if not output.exists():
@@ -760,6 +890,12 @@ class InternalWSClient:
 
         normalized: list[dict[str, Any]] = []
         for row in rows:
+            legacy_base64a = str(row.get("Base64A", "") or "")
+            base64a_md5 = str(row.get("Base64A_MD5", "")).strip()
+            if not base64a_md5:
+                message_id = str(row.get("message_id", "")).strip()
+                if message_id:
+                    base64a_md5 = self._base64a_store.message_id_md5(message_id)
             normalized.append(
                 {
                     "mail_id": str(row.get("mail_id", "")),
@@ -770,7 +906,8 @@ class InternalWSClient:
                     "received_at": str(row.get("received_at", "")),
                     "received_unixtime_ms": self._safe_int(row.get("received_unixtime_ms", 0)),
                     "unixtime_ms": self._safe_int(row.get("unixtime_ms", 0)),
-                    "Base64A": str(row.get("Base64A", "") or ""),
+                    "Base64A": legacy_base64a,
+                    "Base64A_MD5": base64a_md5,
                 }
             )
         return normalized
@@ -926,3 +1063,4 @@ class InternalWSClient:
             csv.field_size_limit(target)
         except OverflowError:
             csv.field_size_limit(current)
+

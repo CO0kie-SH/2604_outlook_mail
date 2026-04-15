@@ -9,3 +9,4 @@
 set fei_title="Outlook IMAP OAuth2 收取邮件"
 
 python main.py %*
+@echo "【BAT脚本末尾】"

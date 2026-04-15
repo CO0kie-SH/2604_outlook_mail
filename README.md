@@ -35,10 +35,10 @@
 - ✅ 基于 JSON-RPC 2.0 的统一请求/响应格式
 - ✅ 登录流程安全队列化（确认与 token 更新串行处理）
 - ✅ Outlook OAuth2 token 获取（优先 refresh_token，回退设备码/缓存）
-- ✅ 邮箱文件夹列表同步并落盘：`result/<前缀>_folders.csv`
+- ✅ 邮箱文件夹列表同步并落盘：`db/<前缀>_folders.csv`
 - ✅ 文件夹邮件数同步：`mail.folder.count`
 - ✅ 文件夹标题与发件人同步：`title`
-- ✅ 支持抓取原始邮件并 URL-safe Base64 存储：`title.base64a`（字段 `Base64A`）
+- ✅ 支持抓取原始邮件并 URL-safe Base64 存储：`title.base64a`（CSV 仅保留 `Base64A_MD5`，原文落 SQLite）
 - ✅ 标题 CSV 自动按送达时间升序落盘（旧 -> 新）
 - ✅ 抓取到标题后自动发送飞书通知（按 `config/FeiShu.csv`，单轮批量汇总）
 - ✅ 文件只读保护：写入前去只读、完成后恢复只读
@@ -67,15 +67,24 @@
 ├── 项目规则.md                      # 项目规则说明
 ├── client/
 │   └── internal_ws_client.py       # 内部 WebSocket 客户端
+├── public/
+│   ├── csv_ops.py                  # CSV 通用操作
+│   ├── sqlite_ops.py               # SQLite 通用操作（Base64A存储）
+│   ├── feishu_ops.py               # 飞书通用操作
+│   ├── email_ops.py                # EML/HTML/TXT 解析与摘要
+│   └── file_ops.py                 # 文本与二进制文件写入
+├── test/
+│   └── validate_restore_export.py  # Base64A 还原导出验证脚本（HTML/TXT 完整性）
 ├── server/
 │   ├── websocket_server.py         # 内部 WebSocket 服务端
 │   └── rpc_docs.py                 # 接口文档页面与渲染逻辑
 ├── config/
 │   ├── OutLook.csv                 # Outlook 账号配置
 │   └── FeiShu.csv                  # 飞书通知配置
-├── result/
+├── db/
 │   ├── *_folders.csv               # 文件夹列表与同步状态
-│   └── *_<folder>.csv              # 标题结果文件
+│   ├── *_<folder>.csv              # 标题结果文件（轻量索引）
+│   └── <provider>.db               # 原始邮件 Base64A 存储（当前: outlook.db）
 └── log/
     └── YYYYMMDD.log                # 运行日志
 ```
@@ -134,11 +143,11 @@
 3) 客户端调用 auth.login -> 获取 cookie
 4) 客户端调用 auth.confirm -> 确认登录
 5) 客户端调用 outlook.token.acquire -> 获取 folders
-6) 客户端落盘 result/<前缀>_folders.csv
+6) 客户端落盘 db/<前缀>_folders.csv
 7) 按 mode 执行扩展：
    - num   -> 调用 mail.folder.count 并回写计数
    - title -> 先 count，再调用 title 落盘标题 CSV
-   - Base64A -> 先 count，再调用 title.base64a 落盘标题+原始内容 Base64
+   - Base64A -> 先 count，再调用 title.base64a（标题落 CSV，原始内容落 SQLite）
 8) 客户端调用 auth.logout
 9) 服务端清理会话；若长期空闲则触发进程退出
 ```
@@ -151,7 +160,7 @@
 
 字段：
 
-- `mail`：配置名（与 `--profile` 对应）
+- `mail`：上游服务商标识（第一列，当前 `outlook`，后续可扩展如 `qqmail`）
 - `user`：邮箱账号
 - `password`：密码（可不使用）
 - `client_id`：Azure 应用 Client ID
@@ -162,8 +171,10 @@
 - CSV 使用 `utf-8-sig` 编码
 - `user/password/client_id/refresh_token` 支持 URL-safe Base64（无 `=`）
 - 环境变量优先级高于 CSV（如 `OUTLOOK_EMAIL`、`OUTLOOK_CLIENT_ID`）
+- Base64A SQLite 文件命名：`db/<mail>.db`（例如 `db/outlook.db`）
+- Base64A 表命名：`base64A_<account>`（SQLite 标识符安全化，`@` 等字符会替换为 `_`）
 
-### 2) 文件夹同步配置：`result/<前缀>_folders.csv`
+### 2) 文件夹同步配置：`db/<前缀>_folders.csv`
 
 字段：
 
@@ -181,9 +192,9 @@
 - 空：仅保留文件夹元数据
 - `num`：同步邮件数量
 - `title`：同步数量 + 标题数据
-- `Base64A`：同步数量 + 标题数据 + 原始邮件 URL-safe Base64（字段 `Base64A`）
+- `Base64A`：同步数量 + 标题数据 + 原始邮件 URL-safe Base64（CSV 字段为 `Base64A_MD5` 引用）
 
-### 3) 标题结果文件：`result/<前缀>_<文件夹名>.csv`
+### 3) 标题结果文件：`db/<前缀>_<文件夹名>.csv`
 
 字段：
 
@@ -195,7 +206,18 @@
 - `received_at`
 - `received_unixtime_ms`
 - `unixtime_ms`
-- `Base64A`（当 `mode=Base64A` 时有值）
+- `Base64A_MD5`（当 `mode=Base64A` 且含 `message_id` 时有值；使用 `md5(message_id)`）
+
+### 3.1) Base64A SQLite 结构
+
+- 数据库文件：`db/<provider>.db`（`provider` 来自 `config/OutLook.csv` 第一列 `mail`）
+- 账号分表：`base64A_<account>`（示例账号 `StevenWong9561@hotmail.com` 对应表名 `base64A_StevenWong9561_hotmail_com`）
+- 关键字段：
+  - `message_id_md5`（主键）
+  - `message_id`
+  - `sender`
+  - `sender_email`
+  - `base64a`
 
 ### 4) 飞书配置：`config/FeiShu.csv`
 
@@ -223,11 +245,12 @@
 - 依赖：
   - `aiohttp`
   - `msal`
+  - `aiosqlite`
 
 安装示例：
 
 ```bash
-pip install aiohttp msal
+pip install aiohttp msal aiosqlite
 ```
 
 ---
@@ -270,6 +293,11 @@ python main.py
 | `--log-file` | `log/YYYYMMDD.log` | 日志文件 |
 | `--log-retention-days` | `30` | 日志保留天数 |
 
+空闲检测环境变量（服务端）：
+
+- `WS_IDLE_CHECK_INTERVAL_SECONDS`：空闲检测间隔秒数，默认 `30`
+- `WS_IDLE_ZERO_LIMIT`：连续无连接阈值次数，默认 `2`
+
 ---
 
 ## 🛠️ 常见操作
@@ -296,6 +324,18 @@ python imap_outlook_oauth2.py --mailbox INBOX
 
 ```bash
 python main.py
+```
+
+### 5) 执行 Base64A 导出验证测试
+
+```bash
+python test/validate_restore_export.py
+```
+
+如需测试前自动先跑一轮主流程：
+
+```bash
+python test/validate_restore_export.py --run-main
 ```
 
 ---
@@ -329,7 +369,7 @@ python main.py
 
 > 🟢 Stable: `26.4.12M`
 
-当前版本：`26.4.15D`  
+当前版本：`26.4.15F`  
 最后更新：`2026-04-15`
 
 ```text
@@ -340,6 +380,22 @@ python main.py
 ---
 
 ## 📝 更新日志
+
+### 26.4.15F (2026-04-15)
+
+- ✨ 新增：`test/validate_restore_export.py` 验证脚本支持按服务商数据库与账号分表自动校验 Base64A 还原导出链路。
+- ✨ 新增：测试脚本覆盖 HTML/TXT 导出完整性检查（含 `</html>` 结束标记、summary 截断检测）。
+- 📝 文档：README 目录结构新增 `test/` 说明，`常见操作` 新增验证测试命令（含 `--run-main`）。
+- 📝 文档：补充并对齐本轮变更记录，确保 `test` 侧更新纳入版本日志。
+
+### 26.4.15E (2026-04-15)
+
+- ✨ 新增：Base64A SQLite 存储按上游服务商命名数据库文件，规则为 `db/<mail>.db`（首列 `mail` 来自 `config/OutLook.csv`，当前为 `db/outlook.db`）。
+- ✨ 新增：Base64A 改为账号分表，规则为 `base64A_<account>`（SQLite 标识符安全化，`@` 等字符替换为 `_`）。
+- ✨ 新增：Base64A 表字段扩展 `sender_email`，从 `sender` 自动提取发件人邮箱地址。
+- ✨ 新增：`public/app_constants.py` 常量配置类，在 `main.py` 初始化并统一管理环境变量。
+- 🔧 优化：服务端空闲检测改为环境变量可配置（`WS_IDLE_CHECK_INTERVAL_SECONDS`、`WS_IDLE_ZERO_LIMIT`），默认仍为 `30` 秒和 `2` 次。
+- 📝 文档：补充服务商首列、数据库/分表命名规则、空闲检测环境变量与验证脚本适配说明。
 
 ### 26.4.15D (2026-04-15)
 

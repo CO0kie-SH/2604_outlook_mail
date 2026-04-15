@@ -1,8 +1,9 @@
-import csv
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import aiohttp
+from public.csv_ops import CsvOps
+from public.feishu_ops import FeishuOps
 
 
 class FeishuNotifier:
@@ -20,15 +21,14 @@ class FeishuNotifier:
 
         configs: List[Dict[str, str]] = []
         try:
-            with self.config_file.open("r", encoding="utf-8-sig", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    tag = str(row.get("tag", "")).strip()
-                    url = str(row.get("url", "")).strip()
-                    mode = str(row.get("mode", "")).strip().lower()
-                    if not tag or not url:
-                        continue
-                    configs.append({"tag": tag, "url": url, "mode": mode or "text"})
+            rows = CsvOps.read_rows(self.config_file, encoding="utf-8-sig")
+            for row in rows:
+                tag = str(row.get("tag", "")).strip()
+                url = str(row.get("url", "")).strip()
+                mode = str(row.get("mode", "")).strip().lower()
+                if not tag or not url:
+                    continue
+                configs.append({"tag": tag, "url": url, "mode": mode or "text"})
             if self.logger:
                 self.logger.info("加载飞书配置 %s 条", len(configs))
         except Exception as exc:
@@ -38,46 +38,10 @@ class FeishuNotifier:
 
     @staticmethod
     def _build_message(body: str, title: Optional[str] = None, mode: str = "text") -> dict:
-        if mode == "text" or title is None:
-            return {
-                "msg_type": "text",
-                "content": {"text": body},
-            }
-        return {
-            "msg_type": "post",
-            "content": {
-                "post": {
-                    "zh-CN": {
-                        "title": title,
-                        "content": [[{"tag": "text", "text": body}]],
-                    }
-                }
-            },
-        }
+        return FeishuOps.build_message(body=body, title=title, mode=mode)
 
     async def _send_to_webhook(self, session: aiohttp.ClientSession, url: str, message: dict) -> bool:
-        try:
-            async with session.post(url, json=message) as response:
-                text = await response.text()
-                if response.status != 200:
-                    if self.logger:
-                        self.logger.error("飞书消息发送失败，状态码=%s body=%s", response.status, text)
-                    return False
-                try:
-                    result = await response.json()
-                except Exception:
-                    result = {}
-                if result.get("StatusCode") == 0:
-                    if self.logger:
-                        self.logger.info("飞书消息发送成功")
-                    return True
-                if self.logger:
-                    self.logger.error("飞书消息发送失败: %s", result or text)
-                return False
-        except Exception as exc:
-            if self.logger:
-                self.logger.error("飞书消息发送异常: %s", exc, exc_info=True)
-            return False
+        return await FeishuOps.send_to_webhook(session=session, url=url, message=message, logger=self.logger)
 
     async def send_message(
         self,
@@ -130,4 +94,3 @@ async def send_feishu_message(
 ) -> Dict[str, bool]:
     notifier = FeishuNotifier(logger=logger)
     return await notifier.send_message(body=v_body, title=v_title, tag=tag)
-

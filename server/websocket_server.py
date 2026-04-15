@@ -26,8 +26,8 @@ from server.rpc_docs import InternalWSDocPages
 class InternalWSServer:
     """邮件模块 WebSocket 服务端，使用 JSON-RPC 2.0 进行内部通信。"""
 
-    IDLE_CHECK_INTERVAL_SECONDS = 30
-    IDLE_ZERO_LIMIT = 2
+    DEFAULT_IDLE_CHECK_INTERVAL_SECONDS = 30
+    DEFAULT_IDLE_ZERO_LIMIT = 2
     QUEUE_ACK_TIMEOUT_SECONDS = 3
     IMAP_KEEPALIVE_INTERVAL_SECONDS = 60
 
@@ -43,11 +43,20 @@ class InternalWSServer:
     RPC_METHOD_FEISHU_NOTIFY = "feishu.notify"
     RPC_METHOD_LOGOUT = "auth.logout"
 
-    def __init__(self, host: str, port: int, logger):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        logger,
+        idle_check_interval_seconds: int = DEFAULT_IDLE_CHECK_INTERVAL_SECONDS,
+        idle_zero_limit: int = DEFAULT_IDLE_ZERO_LIMIT,
+    ):
         self.host = host
         self.port = port
         self.logger = logger
         self._doc_pages = InternalWSDocPages()
+        self.idle_check_interval_seconds = max(1, int(idle_check_interval_seconds))
+        self.idle_zero_limit = max(1, int(idle_zero_limit))
 
         self.ready_event = threading.Event()
         self.shutdown_requested_event = threading.Event()
@@ -76,10 +85,15 @@ class InternalWSServer:
             return
 
         self._stop_event.clear()
+        self.logger.info(
+            "idle checker config: interval_seconds=%s zero_limit=%s",
+            self.idle_check_interval_seconds,
+            self.idle_zero_limit,
+        )
         self._consumer_thread = threading.Thread(target=self._consume_secure_queue, name="ws-secure-queue", daemon=True)
         self._consumer_thread.start()
 
-        # 每 30 秒检查一次客户端连接数，连续两次为 0 则退出。
+        # 周期检查客户端连接数，连续达到阈值次数为 0 则退出。
         self._idle_checker_thread = threading.Thread(target=self._idle_exit_checker, name="ws-idle-checker", daemon=True)
         self._idle_checker_thread.start()
 
@@ -154,15 +168,18 @@ class InternalWSServer:
     def _idle_exit_checker(self) -> None:
         zero_count = 0
         while not self._stop_event.is_set():
-            time.sleep(self.IDLE_CHECK_INTERVAL_SECONDS)
+            time.sleep(self.idle_check_interval_seconds)
             with self._clients_lock:
                 active = self._active_clients
 
             if active == 0:
                 zero_count += 1
                 self.logger.info("idle-check: active_clients=0, zero_count=%s", zero_count)
-                if zero_count >= self.IDLE_ZERO_LIMIT:
-                    self.logger.warning("active_clients is 0 for two checks, requesting shutdown")
+                if zero_count >= self.idle_zero_limit:
+                    self.logger.warning(
+                        "active_clients is 0 for %s checks, requesting shutdown",
+                        self.idle_zero_limit,
+                    )
                     self.shutdown_requested_event.set()
                     return
             else:
