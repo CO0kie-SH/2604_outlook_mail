@@ -1,4 +1,4 @@
-# Outlook WebSocket 邮件模块
+﻿# Outlook WebSocket 邮件模块
 
 🔍 自动同步 Outlook 邮件目录与标题数据
 
@@ -38,10 +38,12 @@
 - ✅ 邮箱文件夹列表同步并落盘：`result/<前缀>_folders.csv`
 - ✅ 文件夹邮件数同步：`mail.folder.count`
 - ✅ 文件夹标题与发件人同步：`title`
+- ✅ 支持抓取原始邮件并 URL-safe Base64 存储：`title.base64a`（字段 `Base64A`）
 - ✅ 标题 CSV 自动按送达时间升序落盘（旧 -> 新）
 - ✅ 抓取到标题后自动发送飞书通知（按 `config/FeiShu.csv`，单轮批量汇总）
 - ✅ 文件只读保护：写入前去只读、完成后恢复只读
 - ✅ 连接空闲守护：连续两次空闲检查无连接则触发进程退出
+- ✅ 内置可视化页面：`/view/mail/clients`、`/view/mail/folders`、`/view/mail/titles`、`/view/mail/logout`
 
 ---
 
@@ -118,6 +120,7 @@
 | `outlook.token.acquire` | 获取/复用 token，并返回文件夹列表 | `cookie` |
 | `mail.folder.count` | 查询单文件夹邮件数量 | `cookie`, `folder_name`, `current_count` |
 | `title` | 查询单文件夹邮件标题、发件人、时间 | `cookie`, `folder_name` |
+| `title.base64a` | 查询单文件夹邮件标题并返回原始邮件 `Base64A` | `cookie`, `folder_name` |
 | `feishu.notify` | 服务端发送飞书通知 | `cookie`, `body`, `title?`, `tag?` |
 | `auth.logout` | 注销会话并清理 cookie | `cookie` |
 
@@ -135,6 +138,7 @@
 7) 按 mode 执行扩展：
    - num   -> 调用 mail.folder.count 并回写计数
    - title -> 先 count，再调用 title 落盘标题 CSV
+   - Base64A -> 先 count，再调用 title.base64a 落盘标题+原始内容 Base64
 8) 客户端调用 auth.logout
 9) 服务端清理会话；若长期空闲则触发进程退出
 ```
@@ -177,6 +181,7 @@
 - 空：仅保留文件夹元数据
 - `num`：同步邮件数量
 - `title`：同步数量 + 标题数据
+- `Base64A`：同步数量 + 标题数据 + 原始邮件 URL-safe Base64（字段 `Base64A`）
 
 ### 3) 标题结果文件：`result/<前缀>_<文件夹名>.csv`
 
@@ -190,6 +195,7 @@
 - `received_at`
 - `received_unixtime_ms`
 - `unixtime_ms`
+- `Base64A`（当 `mode=Base64A` 时有值）
 
 ### 4) 飞书配置：`config/FeiShu.csv`
 
@@ -323,8 +329,8 @@ python main.py
 
 > 🟢 Stable: `26.4.12M`
 
-当前版本：`26.4.12M`  
-最后更新：`2026-04-12`
+当前版本：`26.4.15D`  
+最后更新：`2026-04-15`
 
 ```text
 版本格式：YY.M.DX
@@ -334,6 +340,38 @@ python main.py
 ---
 
 ## 📝 更新日志
+
+### 26.4.15D (2026-04-15)
+
+- 🔧 优化：增量标题同步避免重复读取本地标题 CSV，减少一次磁盘读开销。
+- 🔧 优化：当线上数量小于本地数量时，客户端会自动裁剪本地标题 CSV，保证 `online_count` 与本地结果对齐。
+- 🔧 优化：服务端在“无增量邮件”场景也输出性能日志，便于完整观察链路耗时。
+- 📝 文档：`/doc/mail` 新增性能日志关键字说明（`perf title incremental`、`perf query title*`、`perf fetch title*`）。
+
+### 26.4.15C (2026-04-15)
+
+- 🔧 优化：增量标题同步，按 `incremental_count = max(0, online_count - local_count)` 计算增量请求量。
+- 🔧 优化：`title/title.base64a` 支持可选参数 `known_max_uid`、`incremental_count`，服务端按 UID 增量查询。
+- 🔧 优化：标题 CSV 改为“按 key 合并写入”而非覆盖，减少重复抓取并保留历史。
+- 🔧 优化：补充增量链路性能日志（`perf title incremental`、`perf query title*`、`perf fetch title*`）。
+- 📝 文档：同步 `/doc/mail` 与 README 接口说明，补齐增量参数与行为说明。
+
+### 26.4.15B (2026-04-15)
+
+- 🔧 优化：客户端增量标题同步流程接入 `known_max_uid` 与 `incremental_count` 参数。
+- 🔧 优化：本地标题 CSV 写盘策略由覆盖改为合并（`uid` -> `message_id` -> `mail_id`）。
+- 🔧 优化：新增 CSV 大字段保护（`csv.field_size_limit`），降低 `Base64A` 场景字段长度异常概率。
+- 📝 文档：服务端文档补充 `title/title.base64a` 增量参数说明。
+
+### 26.4.15A (2026-04-15)
+
+- ✨ 新增：页面路由 `/view/mail/clients`、`/view/mail/folders`、`/view/mail/titles`、`/view/mail/logout`，支持在线会话查看、文件夹查看、标题查看和网页触发退出。
+- ✨ 新增：服务端反向 RPC `mail.folders.local.list` 与 `mail.client.force.logout`，客户端支持接收并处理。
+- ✨ 新增：支持 `mode=Base64A`，新增 RPC `title.base64a`，标题结果 CSV 新增字段 `Base64A`。
+- 🔧 优化：`outlook.token.acquire` 改为复用 cookie 会话 IMAP 连接（断连重建），显著降低轮询耗时。
+- 🔧 优化：补充性能日志（客户端端到端、服务端分段、IMAP connect/auth/list 分解）便于定位瓶颈。
+- 🔧 优化：`/view/mail/titles` 改为服务端直接查询 `title`，避免读取超大 `Base64A` CSV 触发字段长度异常。
+- 🔧 优化：`Base64A` 编码按项目规则改为 `urlsafe_b64encode(...).replace(b'=', b'').decode('utf-8')`。
 
 ### 26.4.12M (2026-04-12)
 

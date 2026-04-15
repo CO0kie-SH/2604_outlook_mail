@@ -19,8 +19,6 @@ def resolve_default_client_account() -> str:
         config_path = Path(imap_outlook_oauth2.resolve_default_config_path())
         row = imap_outlook_oauth2.OutlookMailService.load_outlook_config(config_path, profile)
         email_addr = (row.get("user", "") or "").strip()
-        if email_addr and "@" in email_addr:
-            return email_addr.split("@", 1)[0].strip() or "mail"
         if email_addr:
             return email_addr
     except Exception:

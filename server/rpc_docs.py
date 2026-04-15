@@ -32,7 +32,9 @@ class InternalWSDocPages:
   "method": "title",
   "params": {
     "cookie": "***",
-    "folder_name": "Inbox"
+    "folder_name": "Inbox",
+    "known_max_uid": 1024,
+    "incremental_count": 10
   },
   "unixtime_ms": 1776000000000
 }"""
@@ -74,6 +76,21 @@ class InternalWSDocPages:
                     },
                 },
                 {
+                    "title": "Execution Order",
+                    "table": {
+                        "headers": ["Step", "Method", "Notes"],
+                        "rows": [
+                            ["1", "auth.login", "create session cookie"],
+                            ["2", "auth.confirm", "confirm cookie and get enabled methods"],
+                            ["3", "outlook.token.acquire", "get/reuse token and folders"],
+                            ["4", "mail.folder.count", "query folder mail count"],
+                            ["5", "title / title.base64a", "title = header only; base64a = include raw body Base64A"],
+                            ["6", "feishu.notify", "optional summary notify"],
+                            ["7", "auth.logout", "close session and cleanup"],
+                        ],
+                    },
+                },
+                {
                     "title": "auth.login",
                     "body": "Create a temporary login session and receive a cookie.",
                     "table": {
@@ -111,6 +128,19 @@ class InternalWSDocPages:
                     },
                 },
                 {
+                    "title": "title.base64a",
+                    "body": "Fetch folder mail summary plus raw mail body encoded as URL-safe Base64 without '=' padding (field: Base64A). Supports incremental fetch via known_max_uid + incremental_count.",
+                    "table": {
+                        "headers": ["Param", "Type", "Required", "Description"],
+                        "rows": [
+                            ["cookie", "string", "yes", "Session cookie"],
+                            ["folder_name", "string", "yes", "Folder to query"],
+                            ["known_max_uid", "int", "no", "Client local max UID; server searches UID>(known_max_uid)"],
+                            ["incremental_count", "int", "no", "Limit returned incremental rows; usually online_count-local_count"],
+                        ],
+                    },
+                },
+                {
                     "title": "mail.folder.count",
                     "table": {
                         "headers": ["Param", "Type", "Required", "Description"],
@@ -123,12 +153,14 @@ class InternalWSDocPages:
                 },
                 {
                     "title": "title",
-                    "body": "Fetch header-level mail summary from one folder.",
+                    "body": "Fetch header-level mail summary from one folder. Supports incremental fetch via known_max_uid + incremental_count.",
                     "table": {
                         "headers": ["Param", "Type", "Required", "Description"],
                         "rows": [
                             ["cookie", "string", "yes", "Session cookie"],
                             ["folder_name", "string", "yes", "Folder to query"],
+                            ["known_max_uid", "int", "no", "Client local max UID; server searches UID>(known_max_uid)"],
+                            ["incremental_count", "int", "no", "Limit returned incremental rows; usually online_count-local_count"],
                         ],
                     },
                     "code": title_request,
@@ -150,6 +182,50 @@ class InternalWSDocPages:
                     "code": title_response,
                 },
                 {
+                    "title": "title.base64a extra field",
+                    "table": {
+                        "headers": ["Field", "Type", "Description"],
+                        "rows": [
+                            ["Base64A", "string", "URL-safe Base64 encoded raw message (UTF-8 string, '=' removed)"],
+                        ],
+                    },
+                },
+                {
+                    "title": "Server -> Client RPC",
+                    "body": "Server may send JSON-RPC requests to online client via same WebSocket connection.",
+                    "table": {
+                        "headers": ["Method", "Direction", "Description"],
+                        "rows": [
+                            ["mail.folders.local.list", "server -> client", "client reads local *_folders.csv and returns rows"],
+                            ["mail.client.force.logout", "server -> client", "client stops pull loop and calls auth.logout"],
+                        ],
+                    },
+                },
+                {
+                    "title": "View Pages",
+                    "table": {
+                        "headers": ["Path", "Purpose", "Params"],
+                        "rows": [
+                            ["/view/mail/clients", "list online clients", "none"],
+                            ["/view/mail/folders", "view one client's local folder list", "cookie"],
+                            ["/view/mail/titles", "view title list for one folder (server-side title query)", "cookie, folder_name"],
+                            ["/view/mail/logout", "trigger client force logout", "cookie"],
+                        ],
+                    },
+                },
+                {
+                    "title": "Performance Logs",
+                    "body": "Incremental title sync performance can be observed in log/*.log.",
+                    "table": {
+                        "headers": ["Keyword", "Meaning"],
+                        "rows": [
+                            ["perf title incremental", "client-side incremental rpc/write timing"],
+                            ["perf query title / perf query title.base64a", "server RPC elapsed time"],
+                            ["perf fetch title / perf fetch title.base64a", "server IMAP search/fetch timing details"],
+                        ],
+                    },
+                },
+                {
                     "title": "auth.logout",
                     "table": {
                         "headers": ["Param", "Type", "Required", "Description"],
@@ -167,7 +243,7 @@ class InternalWSDocPages:
                             ["-32600", "Invalid Request", "jsonrpc != 2.0 or request shape invalid"],
                             ["-32601", "Method not found", "Unknown method name"],
                             ["-32602", "Invalid params", "Missing required params"],
-                            ["-32003/-32004/-32005/-32006", "Business errors", "cookie invalid/token acquire/folder query failure"],
+                            ["-32003/-32004/-32005/-32006/-32009", "Business errors", "cookie invalid/token acquire/folder query/base64a failure"],
                         ],
                     },
                 },
