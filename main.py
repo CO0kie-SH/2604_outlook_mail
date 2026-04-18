@@ -1,3 +1,5 @@
+"""项目主入口：负责编排服务端线程与客户端线程的一次性同步流程。"""
+
 import argparse
 import sys
 import time
@@ -61,11 +63,13 @@ def main() -> int:
     logger.info("log_dir=%s", log_dir)
     logger.info("python_path=%s", python_path)
     logger.info(
-        "env constants: profile=%s config_path=%s idle_check_interval_seconds=%s idle_zero_limit=%s",
+        "env constants: profile=%s config_path=%s idle_check_interval_seconds=%s idle_zero_limit=%s post_flow_pull_times=%s post_flow_pull_interval_seconds=%s",
         constants.outlook_profile,
         constants.resolved_config_path(project_dir),
         constants.idle_check_interval_seconds,
         constants.idle_zero_limit,
+        constants.post_flow_folder_pull_times,
+        constants.post_flow_folder_pull_interval_seconds,
     )
 
     server = InternalWSServer(
@@ -81,6 +85,8 @@ def main() -> int:
         account=args.client_account,
         password=args.client_password,
         logger=logger,
+        post_flow_folder_pull_times=constants.post_flow_folder_pull_times,
+        post_flow_folder_pull_interval_seconds=constants.post_flow_folder_pull_interval_seconds,
     )
 
     server.start()
@@ -95,6 +101,7 @@ def main() -> int:
 
     try:
         while True:
+            # 服务端空闲守护触发后，主线程统一收口退出。
             if server.shutdown_requested_event.is_set():
                 logger.warning("shutdown requested by server idle guard, stopping process")
                 break

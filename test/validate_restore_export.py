@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import csv
 import logging
 import sqlite3

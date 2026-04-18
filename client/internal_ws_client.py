@@ -17,18 +17,21 @@ from public.sqlite_ops import Base64ASqliteStore
 
 
 class InternalWSClient:
-    """Mail module WebSocket client using JSON-RPC 2.0 flow."""
+    """邮件模块 WebSocket 客户端，使用 JSON-RPC 2.0 流程。"""
     RPC_METHOD_LOCAL_FOLDER_LIST = "mail.folders.local.list"
     RPC_METHOD_LOCAL_TITLE_LIST = "mail.titles.local.list"
     RPC_METHOD_CLIENT_FORCE_LOGOUT = "mail.client.force.logout"
+    RPC_METHOD_FOLDER_IDLE = "mail.folder.idle"
     RPC_TIMEOUT_SECONDS = 20
-    POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS = 8
-    POST_FLOW_FOLDER_PULL_TIMES = 5
+    POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS = 6
+    POST_FLOW_FOLDER_PULL_TIMES = 10
+    IDLE_ONCE_SECONDS = 12
     FOLDER_CSV_FIELDS = [
         "unixtime_ms",
         "name",
         "flags",
         "mode",
+        "idle",
         "current_count",
         "online_count",
         "current_unixtime_ms",
@@ -56,12 +59,16 @@ class InternalWSClient:
         account: str,
         password: str,
         logger,
+        post_flow_folder_pull_times: int = POST_FLOW_FOLDER_PULL_TIMES,
+        post_flow_folder_pull_interval_seconds: int = POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS,
     ):
         self.server_host = server_host
         self.server_port = server_port
         self.account = account
         self.password = password
         self.logger = logger
+        self.post_flow_folder_pull_times = max(1, int(post_flow_folder_pull_times))
+        self.post_flow_folder_pull_interval_seconds = max(1, int(post_flow_folder_pull_interval_seconds))
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -169,7 +176,13 @@ class InternalWSClient:
                 )
                 self.logger.info("folders=%s", self._format_folders_for_log(folders))
                 csv_path = self._save_folders_to_csv(folders)
-                await self._sync_mode_num_counts(ws, cookie, csv_path)
+                await self._run_folder_mode_pipeline(ws, cookie, csv_path)
+                if await self._logout_if_requested(ws, cookie):
+                    await ws.close()
+                    self.logger.info("mail websocket client finished one-shot flow (forced logout)")
+                    return
+
+                await self._run_folder_idle_pipeline(ws, cookie, csv_path)
                 if await self._logout_if_requested(ws, cookie):
                     await ws.close()
                     self.logger.info("mail websocket client finished one-shot flow (forced logout)")
@@ -187,10 +200,10 @@ class InternalWSClient:
                 self.logger.info("mail websocket client finished one-shot flow")
 
     async def _post_flow_pull_folders(self, ws: aiohttp.ClientWebSocketResponse, cookie: str) -> None:
-        for i in range(1, self.POST_FLOW_FOLDER_PULL_TIMES + 1):
+        for i in range(1, self.post_flow_folder_pull_times + 1):
             if self._stop_event.is_set():
                 break
-            await self._wait_with_server_push(ws, self.POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS)
+            await self._wait_with_server_push(ws, self.post_flow_folder_pull_interval_seconds)
             if await self._logout_if_requested(ws, cookie):
                 break
             try:
@@ -201,11 +214,12 @@ class InternalWSClient:
                     params={"cookie": cookie},
                 )
                 folders = token_resp.get("folders", [])
-                self._save_folders_to_csv(folders)
+                csv_path = self._save_folders_to_csv(folders)
+                await self._run_folder_mode_pipeline(ws, cookie, csv_path)
                 self.logger.info(
                     "post-flow folder pull %s/%s: success=%s folders=%s",
                     i,
-                    self.POST_FLOW_FOLDER_PULL_TIMES,
+                    self.post_flow_folder_pull_times,
                     token_resp.get("success"),
                     len(folders) if isinstance(folders, list) else 0,
                 )
@@ -213,7 +227,7 @@ class InternalWSClient:
                 self.logger.exception(
                     "post-flow folder pull failed: round=%s/%s",
                     i,
-                    self.POST_FLOW_FOLDER_PULL_TIMES,
+                    self.post_flow_folder_pull_times,
                 )
             if await self._logout_if_requested(ws, cookie):
                 break
@@ -282,7 +296,8 @@ class InternalWSClient:
             if payload.get("jsonrpc") != "2.0":
                 raise RuntimeError(f"invalid rpc response: {payload}")
 
-            # 鏈嶅姟绔彲鑳藉湪浠绘剰鏃跺埢鍙嶅悜璇锋眰瀹㈡埛绔紝鍏堝鐞嗗悗缁х画绛夊緟鏈璋冪敤鍝嶅簲銆?            if "method" in payload:
+            # 服务端可能在任意时刻反向请求客户端，先处理后再继续等待当前 RPC 响应。
+            if "method" in payload:
                 await self._handle_server_rpc_request(ws, payload)
                 continue
             if payload.get("id") != rpc_id:
@@ -310,7 +325,8 @@ class InternalWSClient:
         if not isinstance(result, dict):
             raise RuntimeError(f"rpc result must be object, method={method}")
 
-        # 鎬ц兘瑙傚療锛氬鎴风鍙戝嚭 JSON-RPC 鍒版敹鍒版枃浠跺す鍒楄〃鐨勭鍒扮鑰楁椂锛堥噸鐐硅娴?outlook.token.acquire锛夈€?        if method == "outlook.token.acquire":
+        # 性能观测：重点记录 outlook.token.acquire 的端到端 RPC 耗时。
+        if method == "outlook.token.acquire":
             elapsed_ms = int((time.perf_counter() - rpc_start) * 1000)
             folders = result.get("folders", [])
             folder_count = len(folders) if isinstance(folders, list) else 0
@@ -463,6 +479,7 @@ class InternalWSClient:
                             "name": item["name"],
                             "flags": json.dumps(item["flags"], ensure_ascii=False),
                             "mode": existed.get("mode", ""),
+                            "idle": existed.get("idle", ""),
                             "current_count": existed.get("current_count", ""),
                             "online_count": existed.get("online_count", ""),
                             "current_unixtime_ms": existed.get("current_unixtime_ms", ""),
@@ -500,6 +517,7 @@ class InternalWSClient:
                     "name": str(row.get("name", "")).strip(),
                     "flags": str(row.get("flags", "")).strip(),
                     "mode": str(row.get("mode", "")).strip(),
+                    "idle": str(row.get("idle", "")).strip(),
                     "current_count": str(row.get("current_count", "")).strip(),
                     "online_count": str(row.get("online_count", "")).strip(),
                 }
@@ -541,7 +559,19 @@ class InternalWSClient:
                 result[name] = row
         return result
 
-    async def _sync_mode_num_counts(self, ws: aiohttp.ClientWebSocketResponse, cookie: str, csv_path: Path) -> None:
+    async def _run_folder_mode_pipeline(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        cookie: str,
+        csv_path: Path,
+    ) -> None:
+        """
+        Unified folder mode pipeline:
+        1) mode=num -> sync online count
+        2) mode=title -> count + incremental title sync to CSV
+        3) mode=base64a -> count + incremental base64a title sync to CSV/SQLite
+        4) batch notify via feishu.notify
+        """
         pending_notifications: list[dict[str, Any]] = []
         self._set_file_writable(csv_path)
         try:
@@ -550,154 +580,14 @@ class InternalWSClient:
 
             changed = False
             for idx, row in enumerate(rows):
-                mode = str(row.get("mode", "")).strip().lower()
-                folder_name = str(row.get("name", "")).strip()
-                if not folder_name:
-                    continue
-
-                if mode not in {"num", "title", "base64a"}:
-                    continue
-
-                current_raw = str(row.get("current_count", "")).strip()
-                try:
-                    request_count = int(current_raw) if current_raw else 0
-                except ValueError:
-                    request_count = 0
-
-                rpc_result = await self._rpc_call(
-                    ws,
-                    rpc_id=10 + idx,
-                    method="mail.folder.count",
-                    params={
-                        "cookie": cookie,
-                        "folder_name": folder_name,
-                        "current_count": request_count,
-                    },
+                row_changed = await self._sync_single_folder_mode(
+                    ws=ws,
+                    cookie=cookie,
+                    row=row,
+                    idx=idx,
+                    pending_notifications=pending_notifications,
                 )
-
-                if not rpc_result.get("success"):
-                    continue
-
-                online_count = int(rpc_result.get("folder_count", 0))
-                update_ms = int(rpc_result.get("update_unixtime_ms", int(time.time() * 1000)))
-                row["online_count"] = str(online_count)
-                row["current_count"] = str(online_count)
-                row["current_unixtime_ms"] = str(update_ms)
-                row["update_unixtime_ms"] = str(update_ms)
-                changed = True
-                self.logger.info(
-                    "folder count synced: folder=%s request_count=%s online_count=%s",
-                    folder_name,
-                    request_count,
-                    online_count,
-                )
-
-                if mode in {"title", "base64a"}:
-                    existing_title_rows = self._load_existing_title_rows_for_merge(folder_name)
-                    local_count = len(existing_title_rows)
-                    known_max_uid = self._extract_known_max_uid(existing_title_rows)
-                    incremental_count = max(0, online_count - local_count)
-                    if mode == "base64a":
-                        db_missing = not self._base64a_store.db_path.exists()
-                        table_missing = not self._base64a_store.table_exists()
-                        if (db_missing or table_missing) and online_count > 0:
-                            self.logger.warning(
-                                "base64a store missing, force full pull: db_missing=%s table_missing=%s folder=%s online_count=%s",
-                                db_missing,
-                                table_missing,
-                                folder_name,
-                                online_count,
-                            )
-                            known_max_uid = None
-                            incremental_count = online_count
-                    self.logger.info(
-                        "title incremental plan: folder=%s mode=%s online_count=%s local_count=%s known_max_uid=%s incremental_count=%s",
-                        folder_name,
-                        mode,
-                        online_count,
-                        local_count,
-                        known_max_uid,
-                        incremental_count,
-                    )
-                    if incremental_count <= 0:
-                        if local_count > online_count:
-                            # Online count reduced (e.g. deleted/moved mails), trim local CSV to stay consistent.
-                            trimmed_count = await self._save_titles_to_csv(
-                                folder_name=folder_name,
-                                titles=[],
-                                expected_count=online_count,
-                                merge_existing=True,
-                                existing_rows=existing_title_rows,
-                            )
-                            self.logger.info(
-                                "title incremental trim: folder=%s mode=%s local_count=%s online_count=%s trimmed_count=%s",
-                                folder_name,
-                                mode,
-                                local_count,
-                                online_count,
-                                trimmed_count,
-                            )
-                        self.logger.info(
-                            "title incremental skip: folder=%s mode=%s reason=no_new_mail",
-                            folder_name,
-                            mode,
-                        )
-                        continue
-                    title_method = "title.base64a" if mode == "base64a" else "title"
-                    title_params: dict[str, Any] = {
-                        "cookie": cookie,
-                        "folder_name": folder_name,
-                        "incremental_count": incremental_count,
-                    }
-                    if known_max_uid is not None:
-                        title_params["known_max_uid"] = known_max_uid
-                    t_title_rpc_start = time.perf_counter()
-                    title_result = await self._rpc_call(
-                        ws,
-                        rpc_id=1000 + idx,
-                        method=title_method,
-                        params=title_params,
-                    )
-                    title_rpc_ms = int((time.perf_counter() - t_title_rpc_start) * 1000)
-                    if title_result.get("success"):
-                        titles = title_result.get("titles", [])
-                        t_title_save_start = time.perf_counter()
-                        merged_count = await self._save_titles_to_csv(
-                            folder_name=folder_name,
-                            titles=titles,
-                            expected_count=online_count,
-                            merge_existing=True,
-                            existing_rows=existing_title_rows,
-                        )
-                        title_save_ms = int((time.perf_counter() - t_title_save_start) * 1000)
-                        increment_fetched = len(titles) if isinstance(titles, list) else 0
-                        pending_notifications.append(
-                            self._build_title_notification_item(
-                                folder_name=folder_name,
-                                titles=titles,
-                                expected_count=online_count,
-                            )
-                        )
-                        self.logger.info(
-                            "folder titles synced: folder=%s mode=%s increment_fetched=%s merged_count=%s",
-                            folder_name,
-                            mode,
-                            increment_fetched,
-                            merged_count,
-                        )
-                        self.logger.info(
-                            "perf title incremental: folder=%s mode=%s online_count=%s local_count=%s incremental_count=%s fetched=%s merged_count=%s rpc_ms=%s save_ms=%s total_ms=%s",
-                            folder_name,
-                            mode,
-                            online_count,
-                            local_count,
-                            incremental_count,
-                            increment_fetched,
-                            merged_count,
-                            title_rpc_ms,
-                            title_save_ms,
-                            title_rpc_ms + title_save_ms,
-                        )
+                changed = changed or row_changed
 
             if not changed:
                 return
@@ -712,6 +602,232 @@ class InternalWSClient:
         self.logger.info("folders csv synced by mode=num/title/base64a: %s", csv_path)
         if pending_notifications:
             await self._send_title_notifications_batch(ws, cookie, pending_notifications)
+
+    async def _sync_mode_num_counts(self, ws: aiohttp.ClientWebSocketResponse, cookie: str, csv_path: Path) -> None:
+        # 兼容旧调用入口，内部统一转发到新流程方法。
+        await self._run_folder_mode_pipeline(ws, cookie, csv_path)
+
+    async def _run_folder_idle_pipeline(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        cookie: str,
+        csv_path: Path,
+    ) -> None:
+        if not csv_path.exists():
+            return
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        for idx, row in enumerate(rows):
+            folder_name = str(row.get("name", "")).strip()
+            idle_mode = str(row.get("idle", "")).strip().upper()
+            if not folder_name or idle_mode != "A":
+                continue
+            try:
+                idle_result = await self._rpc_call(
+                    ws,
+                    rpc_id=2000 + idx,
+                    method=self.RPC_METHOD_FOLDER_IDLE,
+                    params={
+                        "cookie": cookie,
+                        "folder_name": folder_name,
+                        "idle_mode": idle_mode,
+                        "idle_seconds": self.IDLE_ONCE_SECONDS,
+                    },
+                )
+                event_count = int(idle_result.get("event_count", 0) or 0)
+                self.logger.info(
+                    "folder idle requested: folder=%s idle_mode=%s idle_seconds=%s event_count=%s",
+                    folder_name,
+                    idle_mode,
+                    self.IDLE_ONCE_SECONDS,
+                    event_count,
+                )
+            except Exception:
+                self.logger.exception(
+                    "folder idle request failed: folder=%s idle_mode=%s",
+                    folder_name,
+                    idle_mode,
+                )
+
+    async def _sync_single_folder_mode(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        cookie: str,
+        row: dict[str, Any],
+        idx: int,
+        pending_notifications: list[dict[str, Any]],
+    ) -> bool:
+        mode = str(row.get("mode", "")).strip().lower()
+        folder_name = str(row.get("name", "")).strip()
+        if not folder_name:
+            return False
+        if mode not in {"num", "title", "base64a"}:
+            return False
+
+        current_raw = str(row.get("current_count", "")).strip()
+        try:
+            request_count = int(current_raw) if current_raw else 0
+        except ValueError:
+            request_count = 0
+
+        rpc_result = await self._rpc_call(
+            ws,
+            rpc_id=10 + idx,
+            method="mail.folder.count",
+            params={
+                "cookie": cookie,
+                "folder_name": folder_name,
+                "current_count": request_count,
+            },
+        )
+        if not rpc_result.get("success"):
+            return False
+
+        online_count = int(rpc_result.get("folder_count", 0))
+        update_ms = int(rpc_result.get("update_unixtime_ms", int(time.time() * 1000)))
+        row["online_count"] = str(online_count)
+        row["current_count"] = str(online_count)
+        row["current_unixtime_ms"] = str(update_ms)
+        row["update_unixtime_ms"] = str(update_ms)
+        self.logger.info(
+            "folder count synced: folder=%s request_count=%s online_count=%s",
+            folder_name,
+            request_count,
+            online_count,
+        )
+
+        if mode in {"title", "base64a"}:
+            await self._sync_folder_titles_by_mode(
+                ws=ws,
+                cookie=cookie,
+                folder_name=folder_name,
+                mode=mode,
+                online_count=online_count,
+                idx=idx,
+                pending_notifications=pending_notifications,
+            )
+
+        return True
+
+    async def _sync_folder_titles_by_mode(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        cookie: str,
+        folder_name: str,
+        mode: str,
+        online_count: int,
+        idx: int,
+        pending_notifications: list[dict[str, Any]],
+    ) -> None:
+        existing_title_rows = self._load_existing_title_rows_for_merge(folder_name)
+        local_count = len(existing_title_rows)
+        known_max_uid = self._extract_known_max_uid(existing_title_rows)
+        incremental_count = max(0, online_count - local_count)
+        if mode == "base64a":
+            db_missing = not self._base64a_store.db_path.exists()
+            table_missing = not self._base64a_store.table_exists()
+            if (db_missing or table_missing) and online_count > 0:
+                self.logger.warning(
+                    "base64a store missing, force full pull: db_missing=%s table_missing=%s folder=%s online_count=%s",
+                    db_missing,
+                    table_missing,
+                    folder_name,
+                    online_count,
+                )
+                known_max_uid = None
+                incremental_count = online_count
+        self.logger.info(
+            "title incremental plan: folder=%s mode=%s online_count=%s local_count=%s known_max_uid=%s incremental_count=%s",
+            folder_name,
+            mode,
+            online_count,
+            local_count,
+            known_max_uid,
+            incremental_count,
+        )
+        if incremental_count <= 0:
+            if local_count > online_count:
+                # 当线上数量减少（例如删除/移动邮件）时，裁剪本地 CSV 保持一致。
+                trimmed_count = await self._save_titles_to_csv(
+                    folder_name=folder_name,
+                    titles=[],
+                    expected_count=online_count,
+                    merge_existing=True,
+                    existing_rows=existing_title_rows,
+                )
+                self.logger.info(
+                    "title incremental trim: folder=%s mode=%s local_count=%s online_count=%s trimmed_count=%s",
+                    folder_name,
+                    mode,
+                    local_count,
+                    online_count,
+                    trimmed_count,
+                )
+            self.logger.info(
+                "title incremental skip: folder=%s mode=%s reason=no_new_mail",
+                folder_name,
+                mode,
+            )
+            return
+
+        title_method = "title.base64a" if mode == "base64a" else "title"
+        title_params: dict[str, Any] = {
+            "cookie": cookie,
+            "folder_name": folder_name,
+            "incremental_count": incremental_count,
+        }
+        if known_max_uid is not None:
+            title_params["known_max_uid"] = known_max_uid
+        t_title_rpc_start = time.perf_counter()
+        title_result = await self._rpc_call(
+            ws,
+            rpc_id=1000 + idx,
+            method=title_method,
+            params=title_params,
+        )
+        title_rpc_ms = int((time.perf_counter() - t_title_rpc_start) * 1000)
+        if not title_result.get("success"):
+            return
+
+        titles = title_result.get("titles", [])
+        t_title_save_start = time.perf_counter()
+        merged_count = await self._save_titles_to_csv(
+            folder_name=folder_name,
+            titles=titles,
+            expected_count=online_count,
+            merge_existing=True,
+            existing_rows=existing_title_rows,
+        )
+        title_save_ms = int((time.perf_counter() - t_title_save_start) * 1000)
+        increment_fetched = len(titles) if isinstance(titles, list) else 0
+        pending_notifications.append(
+            self._build_title_notification_item(
+                folder_name=folder_name,
+                titles=titles,
+                expected_count=online_count,
+            )
+        )
+        self.logger.info(
+            "folder titles synced: folder=%s mode=%s increment_fetched=%s merged_count=%s",
+            folder_name,
+            mode,
+            increment_fetched,
+            merged_count,
+        )
+        self.logger.info(
+            "perf title incremental: folder=%s mode=%s online_count=%s local_count=%s incremental_count=%s fetched=%s merged_count=%s rpc_ms=%s save_ms=%s total_ms=%s",
+            folder_name,
+            mode,
+            online_count,
+            local_count,
+            incremental_count,
+            increment_fetched,
+            merged_count,
+            title_rpc_ms,
+            title_save_ms,
+            title_rpc_ms + title_save_ms,
+        )
 
     async def _save_titles_to_csv(
         self,
@@ -766,6 +882,10 @@ class InternalWSClient:
         )
         if expected_count >= 0 and len(rows) > expected_count:
             rows = rows[-expected_count:] if expected_count > 0 else []
+
+        # 无论服务端使用 UID 还是序号模式，mail_id 都统一重排为连续展示序号（1..N）。
+        for idx, row in enumerate(rows, start=1):
+            row["mail_id"] = str(idx)
 
         self._set_file_writable(output)
         try:

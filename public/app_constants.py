@@ -22,6 +22,8 @@ class AppConstants:
     outlook_config_path: str
     idle_check_interval_seconds: int
     idle_zero_limit: int
+    post_flow_folder_pull_times: int
+    post_flow_folder_pull_interval_seconds: int
 
     @classmethod
     def from_env(cls) -> "AppConstants":
@@ -36,6 +38,11 @@ class AppConstants:
             outlook_config_path=os.getenv("OUTLOOK_CONFIG_PATH", "config/OutLook.csv").strip() or "config/OutLook.csv",
             idle_check_interval_seconds=_to_int(os.getenv("WS_IDLE_CHECK_INTERVAL_SECONDS", "30"), 30),
             idle_zero_limit=_to_int(os.getenv("WS_IDLE_ZERO_LIMIT", "2"), 2),
+            post_flow_folder_pull_times=_to_int(os.getenv("WS_POST_FLOW_FOLDER_PULL_TIMES", "10"), 10),
+            post_flow_folder_pull_interval_seconds=_to_int(
+                os.getenv("WS_POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS", "6"),
+                6,
+            ),
         )
 
     def resolved_config_path(self, project_dir: Path) -> Path:

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import select
 import threading
 import time
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ class InternalWSServer:
 
     DEFAULT_IDLE_CHECK_INTERVAL_SECONDS = 30
     DEFAULT_IDLE_ZERO_LIMIT = 2
+    CLIENT_RPC_SILENT_CHECK_LIMIT = 2
     QUEUE_ACK_TIMEOUT_SECONDS = 3
     IMAP_KEEPALIVE_INTERVAL_SECONDS = 60
 
@@ -35,6 +37,7 @@ class InternalWSServer:
     RPC_METHOD_CONFIRM = "auth.confirm"
     RPC_METHOD_ACQUIRE = "outlook.token.acquire"
     RPC_METHOD_FOLDER_COUNT = "mail.folder.count"
+    RPC_METHOD_FOLDER_IDLE = "mail.folder.idle"
     RPC_METHOD_TITLE = "title"
     RPC_METHOD_TITLE_BASE64A = "title.base64a"
     RPC_METHOD_LOCAL_FOLDER_LIST = "mail.folders.local.list"
@@ -169,6 +172,10 @@ class InternalWSServer:
         zero_count = 0
         while not self._stop_event.is_set():
             time.sleep(self.idle_check_interval_seconds)
+            stale_cookies = self._collect_stale_client_cookies()
+            for cookie in stale_cookies:
+                self._disconnect_inactive_client(cookie)
+
             with self._clients_lock:
                 active = self._active_clients
 
@@ -185,6 +192,78 @@ class InternalWSServer:
             else:
                 zero_count = 0
                 self.logger.info("idle-check: active_clients=%s, keep running", active)
+
+    def _collect_stale_client_cookies(self) -> list[str]:
+        stale_cookies: list[str] = []
+        with self._session_lock:
+            for cookie, session in self._sessions.items():
+                ws = session.get("ws")
+                if not isinstance(ws, web.WebSocketResponse) or ws.closed:
+                    continue
+
+                last_rpc_ms = self._normalize_non_negative_int(session.get("client_last_rpc_unixtime_ms")) or 0
+                last_checked_ms = self._normalize_non_negative_int(session.get("client_last_rpc_checked_unixtime_ms")) or 0
+                silent_checks = self._normalize_non_negative_int(session.get("client_silent_checks")) or 0
+
+                if last_rpc_ms <= 0 or last_rpc_ms == last_checked_ms:
+                    silent_checks += 1
+                else:
+                    silent_checks = 0
+
+                account = str(session.get("account", "")).strip() or "(unknown)"
+                session["client_last_rpc_checked_unixtime_ms"] = last_rpc_ms
+                session["client_silent_checks"] = silent_checks
+
+                self.logger.info(
+                    "client-rpc-watch: cookie=%s account=%s silent_checks=%s limit=%s last_rpc_unixtime_ms=%s last_checked_unixtime_ms=%s ws_closed=%s",
+                    cookie,
+                    account,
+                    silent_checks,
+                    self.CLIENT_RPC_SILENT_CHECK_LIMIT,
+                    last_rpc_ms,
+                    last_checked_ms,
+                    ws.closed if isinstance(ws, web.WebSocketResponse) else True,
+                )
+
+                if silent_checks >= self.CLIENT_RPC_SILENT_CHECK_LIMIT:
+                    stale_cookies.append(cookie)
+        return stale_cookies
+
+    def _disconnect_inactive_client(self, cookie: str) -> None:
+        with self._session_lock:
+            session = self._sessions.get(cookie)
+            if session is None:
+                return
+            ws = session.get("ws")
+            account = str(session.get("account", "")).strip() or "(unknown)"
+            silent_checks = self._normalize_non_negative_int(session.get("client_silent_checks")) or 0
+            last_rpc_ms = self._normalize_non_negative_int(session.get("client_last_rpc_unixtime_ms")) or 0
+
+        close_attempted = False
+        close_success = False
+        if isinstance(ws, web.WebSocketResponse) and not ws.closed and self._loop and self._loop.is_running():
+            close_attempted = True
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    ws.close(code=1001, message=b"client rpc timeout"),
+                    self._loop,
+                )
+                fut.result(timeout=2)
+                close_success = True
+            except Exception:
+                self.logger.warning("close stale client ws failed: cookie=%s account=%s", cookie, account, exc_info=True)
+
+        self.logger.warning(
+            "client-rpc-timeout-disconnect: cookie=%s account=%s silent_checks=%s limit=%s last_client_rpc_unixtime_ms=%s close_attempted=%s close_success=%s",
+            cookie,
+            account,
+            silent_checks,
+            self.CLIENT_RPC_SILENT_CHECK_LIMIT,
+            last_rpc_ms,
+            close_attempted,
+            close_success,
+        )
+        self._delete_cookie_session(cookie, reason="client_rpc_timeout")
 
     def _consume_secure_queue(self) -> None:
         while not self._stop_event.is_set() or not self._secure_queue.empty():
@@ -268,6 +347,7 @@ class InternalWSServer:
                             self.RPC_METHOD_CONFIRM,
                             self.RPC_METHOD_ACQUIRE,
                             self.RPC_METHOD_FOLDER_COUNT,
+                            self.RPC_METHOD_FOLDER_IDLE,
                             self.RPC_METHOD_TITLE,
                             self.RPC_METHOD_TITLE_BASE64A,
                             self.RPC_METHOD_FEISHU_NOTIFY,
@@ -284,8 +364,11 @@ class InternalWSServer:
                     continue
 
                 if self._try_resolve_server_to_client_rpc_response(ws, msg.data):
+                    if current_cookie:
+                        self._record_client_rpc_activity(current_cookie, msg.data)
                     continue
 
+                activity_cookie = current_cookie
                 response, new_cookie = await self._dispatch_rpc_text(msg.data, current_cookie)
                 if new_cookie is not None:
                     current_cookie = new_cookie
@@ -294,6 +377,12 @@ class InternalWSServer:
                             session = self._sessions.get(current_cookie)
                             if session is not None:
                                 session["ws"] = ws
+                                session["client_last_rpc_checked_unixtime_ms"] = (
+                                    self._normalize_non_negative_int(session.get("client_last_rpc_unixtime_ms")) or 0
+                                )
+                        activity_cookie = current_cookie
+                if activity_cookie:
+                    self._record_client_rpc_activity(activity_cookie, msg.data)
                 if response is not None:
                     await ws.send_json(response)
         finally:
@@ -912,6 +1001,27 @@ class InternalWSServer:
             self._touch_session_last_query(cookie, method)
             return self._rpc_result(rpc_id, data, req_unixtime), cookie
 
+        if method == self.RPC_METHOD_FOLDER_IDLE:
+            cookie = str(params.get("cookie", "")).strip() or current_cookie
+            folder_name = str(params.get("folder_name", "")).strip()
+            idle_mode = str(params.get("idle_mode", "")).strip().upper()
+            idle_seconds = self._normalize_positive_int(params.get("idle_seconds")) or 12
+            idle_seconds = max(1, min(120, idle_seconds))
+            if not cookie or not folder_name:
+                return self._rpc_error(rpc_id, -32602, "cookie and folder_name required", req_unixtime), None
+
+            ok, data = await asyncio.to_thread(
+                self._query_folder_idle,
+                cookie,
+                folder_name,
+                idle_mode,
+                idle_seconds,
+            )
+            if not ok:
+                return self._rpc_error(rpc_id, -32010, data.get("message", "folder idle failed"), req_unixtime), None
+            self._touch_session_last_query(cookie, method)
+            return self._rpc_result(rpc_id, data, req_unixtime), cookie
+
         if method == self.RPC_METHOD_TITLE:
             cookie = str(params.get("cookie", "")).strip() or current_cookie
             folder_name = str(params.get("folder_name", "")).strip()
@@ -1002,6 +1112,7 @@ class InternalWSServer:
 
         cookie = secrets.token_urlsafe(24)
         login_at = datetime.now(timezone.utc).isoformat()
+        now_ms = self._now_ms()
         with self._session_lock:
             self._sessions[cookie] = {
                 "cookie": cookie,
@@ -1014,10 +1125,52 @@ class InternalWSServer:
                 "access_token": "",
                 "token_acquired_at": "",
                 "folders": [],
+                "idle_modes": {},
                 "imap_client": None,
                 "imap_lock": threading.Lock(),
+                "client_last_rpc_at": login_at,
+                "client_last_rpc_unixtime_ms": now_ms,
+                "client_last_rpc_client_unixtime_ms": 0,
+                "client_last_rpc_checked_unixtime_ms": now_ms,
+                "client_silent_checks": 0,
             }
         return {"success": True, "cookie": cookie, "login_at": login_at}
+
+    def _record_client_rpc_activity(self, cookie: str, text: str) -> None:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
+            return
+
+        client_ts = self._normalize_non_negative_int(payload.get("unixtime_ms"))
+        if client_ts is None:
+            client_ts = self._normalize_non_negative_int(payload.get("request_unixtime_ms"))
+
+        now_dt = datetime.now(timezone.utc)
+        now_ms = int(now_dt.timestamp() * 1000)
+        method = str(payload.get("method", "")).strip() or "(response)"
+        rpc_id = payload.get("id")
+        rpc_id_text = str(rpc_id) if rpc_id is not None else "-"
+        with self._session_lock:
+            session = self._sessions.get(cookie)
+            if session is None:
+                return
+            account = str(session.get("account", "")).strip() or "(unknown)"
+            session["client_last_rpc_at"] = now_dt.isoformat()
+            session["client_last_rpc_unixtime_ms"] = now_ms
+            session["client_last_rpc_client_unixtime_ms"] = client_ts or 0
+            session["client_silent_checks"] = 0
+        self.logger.info(
+            "client-rpc-activity: cookie=%s account=%s rpc_id=%s method=%s client_unixtime_ms=%s server_unixtime_ms=%s",
+            cookie,
+            account,
+            rpc_id_text,
+            method,
+            client_ts or 0,
+            now_ms,
+        )
 
     def _touch_session_last_query(self, cookie: str, method: str) -> None:
         now_dt = datetime.now(timezone.utc)
@@ -1044,6 +1197,7 @@ class InternalWSServer:
             "enabled_methods": [
                 self.RPC_METHOD_ACQUIRE,
                 self.RPC_METHOD_FOLDER_COUNT,
+                self.RPC_METHOD_FOLDER_IDLE,
                 self.RPC_METHOD_TITLE,
                 self.RPC_METHOD_TITLE_BASE64A,
                 self.RPC_METHOD_FEISHU_NOTIFY,
@@ -1173,6 +1327,57 @@ class InternalWSServer:
             }
         except Exception as exc:
             self.logger.exception("query folder count failed: folder=%s", folder_name)
+            return False, {"message": str(exc)}
+
+    def _query_folder_idle(
+        self,
+        cookie: str,
+        folder_name: str,
+        idle_mode: str,
+        idle_seconds: int,
+    ) -> tuple[bool, dict[str, Any]]:
+        with self._session_lock:
+            session = self._sessions.get(cookie)
+            if session is None:
+                return False, {"message": "invalid cookie"}
+            access_token = str(session.get("access_token", "")).strip()
+            imap_lock = session.get("imap_lock")
+            if not hasattr(imap_lock, "acquire") or not hasattr(imap_lock, "release"):
+                imap_lock = threading.Lock()
+                session["imap_lock"] = imap_lock
+            idle_modes = session.get("idle_modes")
+            if not isinstance(idle_modes, dict):
+                idle_modes = {}
+                session["idle_modes"] = idle_modes
+            idle_modes[folder_name] = idle_mode
+            session["idle_mode_update_unixtime_ms"] = self._now_ms()
+
+        if idle_mode != "A":
+            return False, {"message": f"unsupported idle_mode: {idle_mode}, only A is supported now"}
+        if not access_token:
+            return False, {"message": "token not ready, call outlook.token.acquire first"}
+
+        try:
+            service = self._build_outlook_service()
+            with imap_lock:
+                events = self._query_folder_idle_with_reconnect(
+                    session=session,
+                    service=service,
+                    access_token=access_token,
+                    folder_name=folder_name,
+                    idle_seconds=idle_seconds,
+                )
+            return True, {
+                "success": True,
+                "folder_name": folder_name,
+                "idle_mode": idle_mode,
+                "idle_seconds": idle_seconds,
+                "event_count": len(events),
+                "events": events,
+                "update_unixtime_ms": self._now_ms(),
+            }
+        except Exception as exc:
+            self.logger.exception("query folder idle failed: folder=%s idle_mode=%s", folder_name, idle_mode)
             return False, {"message": str(exc)}
 
     def _query_folder_titles(
@@ -1367,6 +1572,34 @@ class InternalWSServer:
                 raise
         raise RuntimeError("unreachable")
 
+    def _query_folder_idle_with_reconnect(
+        self,
+        session: dict[str, Any],
+        service: imap_outlook_oauth2.OutlookMailService,
+        access_token: str,
+        folder_name: str,
+        idle_seconds: int,
+    ) -> list[str]:
+        for attempt in range(2):
+            imap = session.get("imap_client")
+            if imap is None:
+                imap = self._create_authenticated_imap(service, access_token)
+                session["imap_client"] = imap
+            try:
+                return self._fetch_folder_idle_events(service, imap, folder_name, idle_seconds)
+            except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError, EOFError) as exc:
+                self.logger.warning(
+                    "folder idle query hit imap connection issue, will retry=%s folder=%s err=%s",
+                    attempt == 0,
+                    folder_name,
+                    exc,
+                )
+                self._drop_session_imap(session)
+                if attempt == 0:
+                    continue
+                raise
+        raise RuntimeError("unreachable")
+
     @staticmethod
     def _fetch_folder_count(service: imap_outlook_oauth2.OutlookMailService, imap, folder_name: str) -> int:
         mailbox_name, _ = service.resolve_mailbox_name(imap, folder_name)
@@ -1379,6 +1612,66 @@ class InternalWSServer:
         if not data or not data[0]:
             return 0
         return len(data[0].split())
+
+    def _fetch_folder_idle_events(
+        self,
+        service: imap_outlook_oauth2.OutlookMailService,
+        imap,
+        folder_name: str,
+        idle_seconds: int,
+    ) -> list[str]:
+        mailbox_name, _ = service.resolve_mailbox_name(imap, folder_name)
+        typ, _ = imap.select(mailbox_name)
+        if typ != "OK":
+            raise RuntimeError(f"select mailbox failed: {folder_name}")
+        if not hasattr(imap, "_new_tag"):
+            raise RuntimeError("imaplib has no _new_tag, cannot run raw IDLE command")
+
+        tag = imap._new_tag()  # type: ignore[attr-defined]
+        tag_text = tag.decode("ascii", errors="ignore") if isinstance(tag, bytes) else str(tag)
+        imap.send(f"{tag_text} IDLE\r\n".encode("ascii"))
+
+        ack_line = self._imap_readline(imap, timeout_seconds=10)
+        if ack_line is None:
+            raise RuntimeError("IDLE ack timeout")
+        ack_text = ack_line.decode("utf-8", errors="replace").strip()
+        self.logger.info("imap idle ack raw: folder=%s line=%s", folder_name, ack_text)
+        if not ack_text.startswith("+"):
+            raise RuntimeError(f"IDLE ack invalid: {ack_text}")
+
+        events: list[str] = []
+        deadline = time.time() + max(1, idle_seconds)
+        while time.time() < deadline:
+            line = self._imap_readline(imap, timeout_seconds=1.0)
+            if line is None:
+                continue
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            events.append(text)
+            self.logger.info("imap idle raw event: folder=%s line=%s", folder_name, text)
+
+        imap.send(b"DONE\r\n")
+        done_deadline = time.time() + 10
+        while time.time() < done_deadline:
+            line = self._imap_readline(imap, timeout_seconds=1.0)
+            if line is None:
+                continue
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            self.logger.info("imap idle done raw: folder=%s line=%s", folder_name, text)
+            if text.startswith(tag_text):
+                break
+            events.append(text)
+
+        self.logger.info(
+            "imap idle once finished: folder=%s idle_seconds=%s event_count=%s",
+            folder_name,
+            idle_seconds,
+            len(events),
+        )
+        return events
 
     def _fetch_folder_titles(
         self,
@@ -1745,6 +2038,19 @@ class InternalWSServer:
         xoauth2 = service.build_xoauth2(service.config.email_addr, access_token)
         imap.authenticate("XOAUTH2", lambda _: xoauth2)
         return imap
+
+    @staticmethod
+    def _imap_readline(imap, timeout_seconds: float) -> bytes | None:
+        sock = getattr(imap, "sock", None)
+        if sock is None:
+            raise RuntimeError("imap socket not available")
+        readable, _, _ = select.select([sock], [], [], max(0.0, timeout_seconds))
+        if not readable:
+            return None
+        line = imap.readline()
+        if not isinstance(line, bytes):
+            return None
+        return line
 
     def _drop_session_imap(self, session: dict[str, Any]) -> None:
         imap = session.pop("imap_client", None)

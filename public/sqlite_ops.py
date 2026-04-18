@@ -1,4 +1,4 @@
-﻿import hashlib
+import hashlib
 import logging
 import re
 import time

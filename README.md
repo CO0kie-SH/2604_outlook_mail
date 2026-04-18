@@ -37,6 +37,7 @@
 - ✅ Outlook OAuth2 token 获取（优先 refresh_token，回退设备码/缓存）
 - ✅ 邮箱文件夹列表同步并落盘：`db/<前缀>_folders.csv`
 - ✅ 文件夹邮件数同步：`mail.folder.count`
+- ✅ 支持按文件夹执行一次性 IMAP IDLE 观测：`mail.folder.idle`（`idle=A`）
 - ✅ 文件夹标题与发件人同步：`title`
 - ✅ 支持抓取原始邮件并 URL-safe Base64 存储：`title.base64a`（CSV 仅保留 `Base64A_MD5`，原文落 SQLite）
 - ✅ 标题 CSV 自动按送达时间升序落盘（旧 -> 新）
@@ -74,7 +75,8 @@
 │   ├── email_ops.py                # EML/HTML/TXT 解析与摘要
 │   └── file_ops.py                 # 文本与二进制文件写入
 ├── test/
-│   └── validate_restore_export.py  # Base64A 还原导出验证脚本（HTML/TXT 完整性）
+│   ├── validate_restore_export.py  # Base64A 还原导出验证脚本（HTML/TXT 完整性）
+│   └── validate_imap_idle_once.py  # 一次性 IMAP IDLE 推送验证脚本
 ├── server/
 │   ├── websocket_server.py         # 内部 WebSocket 服务端
 │   └── rpc_docs.py                 # 接口文档页面与渲染逻辑
@@ -128,6 +130,7 @@
 | `auth.confirm` | 确认 cookie，返回可用方法列表 | `cookie` |
 | `outlook.token.acquire` | 获取/复用 token，并返回文件夹列表 | `cookie` |
 | `mail.folder.count` | 查询单文件夹邮件数量 | `cookie`, `folder_name`, `current_count` |
+| `mail.folder.idle` | 按文件夹执行一次性 IDLE 并返回原始事件行 | `cookie`, `folder_name`, `idle_mode`, `idle_seconds?` |
 | `title` | 查询单文件夹邮件标题、发件人、时间 | `cookie`, `folder_name` |
 | `title.base64a` | 查询单文件夹邮件标题并返回原始邮件 `Base64A` | `cookie`, `folder_name` |
 | `feishu.notify` | 服务端发送飞书通知 | `cookie`, `body`, `title?`, `tag?` |
@@ -147,9 +150,90 @@
 7) 按 mode 执行扩展：
    - num   -> 调用 mail.folder.count 并回写计数
    - title -> 先 count，再调用 title 落盘标题 CSV
-   - Base64A -> 先 count，再调用 title.base64a（标题落 CSV，原始内容落 SQLite）
-8) 客户端调用 auth.logout
-9) 服务端清理会话；若长期空闲则触发进程退出
+   - base64a -> 先 count，再调用 title.base64a（标题落 CSV，原始内容落 SQLite）
+8) 按 idle 执行扩展：
+   - idle=A -> 调用 mail.folder.idle，服务端在该文件夹执行一次性 IMAP IDLE 并记录原始事件日志
+9) 客户端执行 post-flow 再拉取若干轮文件夹（默认 10 轮，每轮间隔 6 秒）
+10) 客户端调用 auth.logout
+11) 服务端清理会话；若长期空闲则触发进程退出
+```
+
+### 时序图（客户端/服务端）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 客户端 InternalWSClient
+    participant S as 服务端 InternalWSServer
+    participant I as Outlook IMAP
+    participant F as 飞书 Webhook
+
+    C->>S: WebSocket 连接 /ws/mail
+    S-->>C: mail.capabilities
+
+    C->>S: auth.login(account,password)
+    S-->>C: cookie
+    C->>S: auth.confirm(cookie)
+    S-->>C: enabled_methods
+
+    C->>S: outlook.token.acquire(cookie)
+    S->>I: OAuth2 + list mailboxes
+    I-->>S: folders
+    S-->>C: token + folders
+    C->>C: 写 db/<account>_folders.csv
+
+    loop 按 folders.csv 遍历 folder
+        alt mode=num/title/base64a
+            C->>S: mail.folder.count(cookie,folder,current_count)
+            S->>I: select + search
+            I-->>S: folder_count
+            S-->>C: online_count
+            C->>C: 回写 current_count/online_count
+        end
+
+        alt mode=title
+            C->>S: title(cookie,folder,known_max_uid,incremental_count)
+            S->>I: 增量查询标题
+            I-->>S: titles
+            S-->>C: titles
+            C->>C: 合并写 db/<account>_<folder>.csv
+        end
+
+        alt mode=base64a
+            C->>S: title.base64a(cookie,folder,...)
+            S->>I: 增量查询标题+原文
+            I-->>S: titles + Base64A
+            S-->>C: titles + Base64A
+            C->>C: CSV 写 Base64A_MD5 索引
+            C->>C: SQLite 写 db/<provider>.db/base64A_<account>
+        end
+    end
+
+    opt 本轮有标题增量
+        C->>S: feishu.notify(cookie,body,title)
+        S->>F: 发送消息
+        F-->>S: send result
+        S-->>C: success_count/results
+    end
+
+    opt idle=A
+        C->>S: mail.folder.idle(cookie,folder,idle_mode=A,idle_seconds)
+        S->>I: 一次性 IMAP IDLE
+        I-->>S: 原始 IDLE 行
+        S-->>C: event_count/events
+    end
+
+    loop post-flow 默认 10 轮，每轮 6 秒
+        C->>S: outlook.token.acquire(cookie)
+        S->>I: list mailboxes
+        I-->>S: folders
+        S-->>C: folders
+        C->>C: 重复 mode 同步流程
+    end
+
+    C->>S: auth.logout(cookie)
+    S-->>C: logout success
+    S->>S: 清理 cookie/session/IMAP
 ```
 
 ---
@@ -182,6 +266,7 @@
 - `name`
 - `flags`
 - `mode`
+- `idle`
 - `current_count`
 - `online_count`
 - `current_unixtime_ms`
@@ -192,7 +277,12 @@
 - 空：仅保留文件夹元数据
 - `num`：同步邮件数量
 - `title`：同步数量 + 标题数据
-- `Base64A`：同步数量 + 标题数据 + 原始邮件 URL-safe Base64（CSV 字段为 `Base64A_MD5` 引用）
+- `base64a`（兼容 `Base64A`）：同步数量 + 标题数据 + 原始邮件 URL-safe Base64（CSV 字段为 `Base64A_MD5` 引用）
+
+`idle` 约定：
+
+- 空：不执行 IDLE
+- `A`：执行一次性 IMAP IDLE（原始响应写日志，当前用于观测）
 
 ### 3) 标题结果文件：`db/<前缀>_<文件夹名>.csv`
 
@@ -298,6 +388,11 @@ python main.py
 - `WS_IDLE_CHECK_INTERVAL_SECONDS`：空闲检测间隔秒数，默认 `30`
 - `WS_IDLE_ZERO_LIMIT`：连续无连接阈值次数，默认 `2`
 
+post-flow 环境变量（客户端）：
+
+- `WS_POST_FLOW_FOLDER_PULL_TIMES`：post-flow 拉取轮数，默认 `10`
+- `WS_POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS`：post-flow 轮询间隔秒数，默认 `6`
+
 ---
 
 ## 🛠️ 常见操作
@@ -338,6 +433,12 @@ python test/validate_restore_export.py
 python test/validate_restore_export.py --run-main
 ```
 
+### 6) 执行一次性 IMAP IDLE 验证测试
+
+```bash
+python test/validate_imap_idle_once.py --mailbox INBOX --idle-seconds 90
+```
+
 ---
 
 ## 🚨 故障排查
@@ -369,8 +470,8 @@ python test/validate_restore_export.py --run-main
 
 > 🟢 Stable: `26.4.12M`
 
-当前版本：`26.4.15F`  
-最后更新：`2026-04-15`
+当前版本：`26.4.18A`  
+最后更新：`2026-04-18`
 
 ```text
 版本格式：YY.M.DX
@@ -380,6 +481,14 @@ python test/validate_restore_export.py --run-main
 ---
 
 ## 📝 更新日志
+
+### 26.4.18A (2026-04-18)
+
+- ✨ 新增：`mail.folder.idle` 一次性 IDLE 观测流程，支持 `*_folders.csv` 的 `idle=A` 按文件夹触发，服务端记录 IMAP 原始 IDLE 行日志。
+- ✨ 新增：`*_folders.csv` 扩展字段 `idle`，并在客户端写回文件夹列表时保留已有 `mode/idle` 配置。
+- 🔧 优化：post-flow 拉取默认改为 `10` 轮、每轮 `6` 秒，并接入环境变量 `WS_POST_FLOW_FOLDER_PULL_TIMES`、`WS_POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS`。
+- 🔧 优化：IDLE 验证脚本 `test/validate_imap_idle_once.py` 的 FETCH 头字段去重（移除重复 `FROM`）。
+- 📝 文档：同步 `/doc/mail` 与 README，补齐 `mail.folder.idle` 方法、执行顺序、`idle` 字段说明与新增测试命令。
 
 ### 26.4.15F (2026-04-15)
 
