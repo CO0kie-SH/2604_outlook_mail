@@ -23,9 +23,10 @@ class InternalWSClient:
     RPC_METHOD_CLIENT_FORCE_LOGOUT = "mail.client.force.logout"
     RPC_METHOD_FOLDER_IDLE = "mail.folder.idle"
     RPC_TIMEOUT_SECONDS = 20
-    POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS = 6
-    POST_FLOW_FOLDER_PULL_TIMES = 10
-    IDLE_ONCE_SECONDS = 12
+    POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS = 12
+    POST_FLOW_FOLDER_PULL_TIMES = 11
+    POST_FLOW_FOLDER_REFRESH_EVERY = 10
+    IDLE_RPC_TIMEOUT_MARGIN_SECONDS = 2
     FOLDER_CSV_FIELDS = [
         "unixtime_ms",
         "name",
@@ -61,6 +62,7 @@ class InternalWSClient:
         logger,
         post_flow_folder_pull_times: int = POST_FLOW_FOLDER_PULL_TIMES,
         post_flow_folder_pull_interval_seconds: int = POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS,
+        post_flow_folder_refresh_every: int = POST_FLOW_FOLDER_REFRESH_EVERY,
     ):
         self.server_host = server_host
         self.server_port = server_port
@@ -69,6 +71,7 @@ class InternalWSClient:
         self.logger = logger
         self.post_flow_folder_pull_times = max(1, int(post_flow_folder_pull_times))
         self.post_flow_folder_pull_interval_seconds = max(1, int(post_flow_folder_pull_interval_seconds))
+        self.post_flow_folder_refresh_every = max(0, int(post_flow_folder_refresh_every))
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -86,6 +89,12 @@ class InternalWSClient:
             self._provider_name,
             self._base64a_db_path(),
             self._base64a_table_name,
+        )
+        self.logger.info(
+            "post-flow light poll configured: times=%s interval_seconds=%s folder_refresh_every=%s",
+            self.post_flow_folder_pull_times,
+            self.post_flow_folder_pull_interval_seconds,
+            self.post_flow_folder_refresh_every,
         )
         self._ensure_csv_field_limit()
 
@@ -182,12 +191,6 @@ class InternalWSClient:
                     self.logger.info("mail websocket client finished one-shot flow (forced logout)")
                     return
 
-                await self._run_folder_idle_pipeline(ws, cookie, csv_path)
-                if await self._logout_if_requested(ws, cookie):
-                    await ws.close()
-                    self.logger.info("mail websocket client finished one-shot flow (forced logout)")
-                    return
-
                 await self._post_flow_pull_folders(ws, cookie)
                 if await self._logout_if_requested(ws, cookie):
                     await ws.close()
@@ -200,37 +203,105 @@ class InternalWSClient:
                 self.logger.info("mail websocket client finished one-shot flow")
 
     async def _post_flow_pull_folders(self, ws: aiohttp.ClientWebSocketResponse, cookie: str) -> None:
+        csv_path = self._folders_csv_path().resolve()
         for i in range(1, self.post_flow_folder_pull_times + 1):
             if self._stop_event.is_set():
                 break
-            await self._wait_with_server_push(ws, self.post_flow_folder_pull_interval_seconds)
+            idle_wait_stats = await self._wait_post_flow_round(ws, cookie, csv_path, i)
             if await self._logout_if_requested(ws, cookie):
                 break
+            round_start = time.perf_counter()
+            source = "local_csv"
             try:
-                token_resp = await self._rpc_call(
+                if self._should_refresh_post_flow_folders(i) or not csv_path.exists():
+                    source = "remote_refresh"
+                    token_resp = await self._rpc_call(
+                        ws,
+                        rpc_id=4000 + i,
+                        method="outlook.token.acquire",
+                        params={"cookie": cookie},
+                    )
+                    folders = token_resp.get("folders", [])
+                    csv_path = self._save_folders_to_csv(folders)
+                    folder_count = len(folders) if isinstance(folders, list) else 0
+                else:
+                    folder_count = self._count_local_folder_rows(csv_path)
+                idle_event_folders = set(idle_wait_stats.get("idle_event_folders", []))
+                stats = await self._run_folder_mode_pipeline(
                     ws,
-                    rpc_id=4000 + i,
-                    method="outlook.token.acquire",
-                    params={"cookie": cookie},
+                    cookie,
+                    csv_path,
+                    skip_idle_fallback=True,
+                    idle_event_folders=idle_event_folders,
                 )
-                folders = token_resp.get("folders", [])
-                csv_path = self._save_folders_to_csv(folders)
-                await self._run_folder_mode_pipeline(ws, cookie, csv_path)
+                elapsed_ms = int((time.perf_counter() - round_start) * 1000)
                 self.logger.info(
-                    "post-flow folder pull %s/%s: success=%s folders=%s",
+                    "post-flow light poll %s/%s: source=%s wait=%s idle_folders=%s idle_events=%s folders=%s active_modes=%s idle_skipped=%s count_synced=%s title_fetched=%s notifications=%s elapsed_ms=%s csv=%s",
                     i,
                     self.post_flow_folder_pull_times,
-                    token_resp.get("success"),
-                    len(folders) if isinstance(folders, list) else 0,
+                    source,
+                    idle_wait_stats.get("wait_source", "sleep"),
+                    idle_wait_stats.get("idle_folder_count", 0),
+                    idle_wait_stats.get("idle_event_count", 0),
+                    folder_count,
+                    stats.get("active_mode_count", 0),
+                    stats.get("idle_skipped", 0),
+                    stats.get("count_synced", 0),
+                    stats.get("title_fetched", 0),
+                    stats.get("notification_count", 0),
+                    elapsed_ms,
+                    csv_path,
                 )
             except Exception:
                 self.logger.exception(
-                    "post-flow folder pull failed: round=%s/%s",
+                    "post-flow light poll failed: round=%s/%s source=%s csv=%s",
                     i,
                     self.post_flow_folder_pull_times,
+                    source,
+                    csv_path,
                 )
             if await self._logout_if_requested(ws, cookie):
                 break
+
+    async def _wait_post_flow_round(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        cookie: str,
+        csv_path: Path,
+        round_index: int,
+    ) -> dict[str, Any]:
+        idle_seconds = self._post_flow_idle_seconds()
+        idle_stats = await self._run_folder_idle_pipeline(
+            ws,
+            cookie,
+            csv_path,
+            idle_seconds=idle_seconds,
+            rpc_id_base=3000 + round_index * 100,
+            return_on_event=True,
+        )
+        if idle_stats.get("idle_folder_count", 0) > 0:
+            event_count = int(idle_stats.get("idle_event_count", 0) or 0)
+            idle_stats["wait_source"] = "idle_event" if event_count > 0 else "idle_timeout"
+            return idle_stats
+
+        await self._wait_with_server_push(ws, self.post_flow_folder_pull_interval_seconds)
+        return {"wait_source": "sleep", "idle_folder_count": 0, "idle_event_count": 0}
+
+    def _post_flow_idle_seconds(self) -> int:
+        timeout_limit = max(1, self.RPC_TIMEOUT_SECONDS - self.IDLE_RPC_TIMEOUT_MARGIN_SECONDS)
+        return max(1, min(self.post_flow_folder_pull_interval_seconds, timeout_limit))
+
+    def _should_refresh_post_flow_folders(self, round_index: int) -> bool:
+        if self.post_flow_folder_refresh_every <= 0:
+            return False
+        return round_index % self.post_flow_folder_refresh_every == 0
+
+    @staticmethod
+    def _count_local_folder_rows(csv_path: Path) -> int:
+        if not csv_path.exists():
+            return 0
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+            return sum(1 for _ in csv.DictReader(f))
 
     async def _wait_with_server_push(self, ws: aiohttp.ClientWebSocketResponse, wait_seconds: int) -> None:
         deadline = time.time() + max(0, wait_seconds)
@@ -564,7 +635,9 @@ class InternalWSClient:
         ws: aiohttp.ClientWebSocketResponse,
         cookie: str,
         csv_path: Path,
-    ) -> None:
+        skip_idle_fallback: bool = False,
+        idle_event_folders: set[str] | None = None,
+    ) -> dict[str, int]:
         """
         Unified folder mode pipeline:
         1) mode=num -> sync online count
@@ -573,35 +646,82 @@ class InternalWSClient:
         4) batch notify via feishu.notify
         """
         pending_notifications: list[dict[str, Any]] = []
+        stats = {
+            "row_count": 0,
+            "active_mode_count": 0,
+            "count_synced": 0,
+            "title_fetched": 0,
+            "notification_count": 0,
+            "idle_skipped": 0,
+        }
+        idle_event_folders = idle_event_folders or set()
+        pipeline_start = time.perf_counter()
+        if not csv_path.exists():
+            self.logger.warning("folder mode pipeline skipped: csv not found: %s", csv_path)
+            return stats
         self._set_file_writable(csv_path)
+        changed = False
         try:
             with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.DictReader(f))
+            stats["row_count"] = len(rows)
 
-            changed = False
             for idx, row in enumerate(rows):
-                row_changed = await self._sync_single_folder_mode(
+                folder_name = str(row.get("name", "")).strip()
+                mode = str(row.get("mode", "")).strip().lower()
+                if mode in {"num", "title", "base64a"}:
+                    stats["active_mode_count"] += 1
+                idle_mode = str(row.get("idle", "")).strip().upper()
+                if (
+                    skip_idle_fallback
+                    and idle_mode == "A"
+                    and mode in {"num", "title", "base64a"}
+                    and folder_name not in idle_event_folders
+                ):
+                    stats["idle_skipped"] += 1
+                    self.logger.info(
+                        "folder mode skipped by idle policy: folder=%s mode=%s idle=%s reason=no_idle_event",
+                        folder_name,
+                        mode,
+                        idle_mode,
+                    )
+                    continue
+                row_stats = await self._sync_single_folder_mode(
                     ws=ws,
                     cookie=cookie,
                     row=row,
                     idx=idx,
                     pending_notifications=pending_notifications,
                 )
-                changed = changed or row_changed
+                changed = changed or bool(row_stats.get("changed", 0))
+                stats["count_synced"] += int(row_stats.get("count_synced", 0))
+                stats["title_fetched"] += int(row_stats.get("title_fetched", 0))
 
-            if not changed:
-                return
-
-            with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=self.FOLDER_CSV_FIELDS)
-                writer.writeheader()
-                for row in rows:
-                    writer.writerow({key: row.get(key, "") for key in self.FOLDER_CSV_FIELDS})
+            if changed:
+                with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=self.FOLDER_CSV_FIELDS)
+                    writer.writeheader()
+                    for row in rows:
+                        writer.writerow({key: row.get(key, "") for key in self.FOLDER_CSV_FIELDS})
         finally:
             self._set_file_readonly(csv_path)
-        self.logger.info("folders csv synced by mode=num/title/base64a: %s", csv_path)
+        stats["notification_count"] = len(pending_notifications)
+        elapsed_ms = int((time.perf_counter() - pipeline_start) * 1000)
+        self.logger.info(
+            "folder mode pipeline done: csv=%s rows=%s active_modes=%s idle_skipped=%s count_synced=%s title_fetched=%s changed=%s notifications=%s elapsed_ms=%s",
+            csv_path,
+            stats["row_count"],
+            stats["active_mode_count"],
+            stats["idle_skipped"],
+            stats["count_synced"],
+            stats["title_fetched"],
+            int(changed),
+            stats["notification_count"],
+            elapsed_ms,
+        )
         if pending_notifications:
             await self._send_title_notifications_batch(ws, cookie, pending_notifications)
+        return stats
 
     async def _sync_mode_num_counts(self, ws: aiohttp.ClientWebSocketResponse, cookie: str, csv_path: Path) -> None:
         # 兼容旧调用入口，内部统一转发到新流程方法。
@@ -612,9 +732,14 @@ class InternalWSClient:
         ws: aiohttp.ClientWebSocketResponse,
         cookie: str,
         csv_path: Path,
-    ) -> None:
+        idle_seconds: int | None = None,
+        rpc_id_base: int = 2000,
+        return_on_event: bool = False,
+    ) -> dict[str, Any]:
+        stats: dict[str, Any] = {"idle_folder_count": 0, "idle_event_count": 0, "idle_event_folders": []}
         if not csv_path.exists():
-            return
+            return stats
+        idle_seconds = max(1, int(idle_seconds or self._post_flow_idle_seconds()))
         with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
             rows = list(csv.DictReader(f))
 
@@ -623,24 +748,30 @@ class InternalWSClient:
             idle_mode = str(row.get("idle", "")).strip().upper()
             if not folder_name or idle_mode != "A":
                 continue
+            stats["idle_folder_count"] += 1
             try:
                 idle_result = await self._rpc_call(
                     ws,
-                    rpc_id=2000 + idx,
+                    rpc_id=rpc_id_base + idx,
                     method=self.RPC_METHOD_FOLDER_IDLE,
                     params={
                         "cookie": cookie,
                         "folder_name": folder_name,
                         "idle_mode": idle_mode,
-                        "idle_seconds": self.IDLE_ONCE_SECONDS,
+                        "idle_seconds": idle_seconds,
+                        "return_on_event": return_on_event,
                     },
                 )
                 event_count = int(idle_result.get("event_count", 0) or 0)
+                stats["idle_event_count"] += event_count
+                if event_count > 0:
+                    stats["idle_event_folders"].append(folder_name)
                 self.logger.info(
-                    "folder idle requested: folder=%s idle_mode=%s idle_seconds=%s event_count=%s",
+                    "folder idle requested: folder=%s idle_mode=%s idle_seconds=%s return_on_event=%s event_count=%s",
                     folder_name,
                     idle_mode,
-                    self.IDLE_ONCE_SECONDS,
+                    idle_seconds,
+                    return_on_event,
                     event_count,
                 )
             except Exception:
@@ -649,6 +780,7 @@ class InternalWSClient:
                     folder_name,
                     idle_mode,
                 )
+        return stats
 
     async def _sync_single_folder_mode(
         self,
@@ -657,13 +789,14 @@ class InternalWSClient:
         row: dict[str, Any],
         idx: int,
         pending_notifications: list[dict[str, Any]],
-    ) -> bool:
+    ) -> dict[str, int]:
+        stats = {"changed": 0, "count_synced": 0, "title_fetched": 0}
         mode = str(row.get("mode", "")).strip().lower()
         folder_name = str(row.get("name", "")).strip()
         if not folder_name:
-            return False
+            return stats
         if mode not in {"num", "title", "base64a"}:
-            return False
+            return stats
 
         current_raw = str(row.get("current_count", "")).strip()
         try:
@@ -682,14 +815,16 @@ class InternalWSClient:
             },
         )
         if not rpc_result.get("success"):
-            return False
+            return stats
 
         online_count = int(rpc_result.get("folder_count", 0))
         update_ms = int(rpc_result.get("update_unixtime_ms", int(time.time() * 1000)))
+        stats["count_synced"] = 1
         row["online_count"] = str(online_count)
         row["current_count"] = str(online_count)
         row["current_unixtime_ms"] = str(update_ms)
         row["update_unixtime_ms"] = str(update_ms)
+        stats["changed"] = 1
         self.logger.info(
             "folder count synced: folder=%s request_count=%s online_count=%s",
             folder_name,
@@ -698,7 +833,7 @@ class InternalWSClient:
         )
 
         if mode in {"title", "base64a"}:
-            await self._sync_folder_titles_by_mode(
+            stats["title_fetched"] = await self._sync_folder_titles_by_mode(
                 ws=ws,
                 cookie=cookie,
                 folder_name=folder_name,
@@ -708,7 +843,7 @@ class InternalWSClient:
                 pending_notifications=pending_notifications,
             )
 
-        return True
+        return stats
 
     async def _sync_folder_titles_by_mode(
         self,
@@ -719,7 +854,7 @@ class InternalWSClient:
         online_count: int,
         idx: int,
         pending_notifications: list[dict[str, Any]],
-    ) -> None:
+    ) -> int:
         existing_title_rows = self._load_existing_title_rows_for_merge(folder_name)
         local_count = len(existing_title_rows)
         known_max_uid = self._extract_known_max_uid(existing_title_rows)
@@ -769,7 +904,7 @@ class InternalWSClient:
                 folder_name,
                 mode,
             )
-            return
+            return 0
 
         title_method = "title.base64a" if mode == "base64a" else "title"
         title_params: dict[str, Any] = {
@@ -788,7 +923,7 @@ class InternalWSClient:
         )
         title_rpc_ms = int((time.perf_counter() - t_title_rpc_start) * 1000)
         if not title_result.get("success"):
-            return
+            return 0
 
         titles = title_result.get("titles", [])
         t_title_save_start = time.perf_counter()
@@ -828,6 +963,7 @@ class InternalWSClient:
             title_save_ms,
             title_rpc_ms + title_save_ms,
         )
+        return increment_fetched
 
     async def _save_titles_to_csv(
         self,

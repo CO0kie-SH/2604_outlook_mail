@@ -37,7 +37,8 @@
 - ✅ Outlook OAuth2 token 获取（优先 refresh_token，回退设备码/缓存）
 - ✅ 邮箱文件夹列表同步并落盘：`db/<前缀>_folders.csv`
 - ✅ 文件夹邮件数同步：`mail.folder.count`
-- ✅ 支持按文件夹执行一次性 IMAP IDLE 观测：`mail.folder.idle`（`idle=A`）
+- ✅ 支持按文件夹在 post-flow 等待阶段执行 IMAP IDLE：`mail.folder.idle`（`idle=A`）
+- ✅ 支持 IDLE 与 post-flow 对比模式：`idle=A` 文件夹无事件时跳过兜底，未启用 IDLE 的文件夹继续轮询兜底
 - ✅ 文件夹标题与发件人同步：`title`
 - ✅ 支持抓取原始邮件并 URL-safe Base64 存储：`title.base64a`（CSV 仅保留 `Base64A_MD5`，原文落 SQLite）
 - ✅ 标题 CSV 自动按送达时间升序落盘（旧 -> 新）
@@ -45,6 +46,7 @@
 - ✅ 文件只读保护：写入前去只读、完成后恢复只读
 - ✅ 连接空闲守护：连续两次空闲检查无连接则触发进程退出
 - ✅ 内置可视化页面：`/view/mail/clients`、`/view/mail/folders`、`/view/mail/titles`、`/view/mail/logout`
+- ✅ 标题页面默认读取本地 CSV，仍可通过 `live=1` 切换实时 IMAP 查询
 
 ---
 
@@ -130,7 +132,7 @@
 | `auth.confirm` | 确认 cookie，返回可用方法列表 | `cookie` |
 | `outlook.token.acquire` | 获取/复用 token，并返回文件夹列表 | `cookie` |
 | `mail.folder.count` | 查询单文件夹邮件数量 | `cookie`, `folder_name`, `current_count` |
-| `mail.folder.idle` | 按文件夹执行一次性 IDLE 并返回原始事件行 | `cookie`, `folder_name`, `idle_mode`, `idle_seconds?` |
+| `mail.folder.idle` | 按文件夹执行 IDLE 并返回原始事件行 | `cookie`, `folder_name`, `idle_mode`, `idle_seconds?`, `return_on_event?` |
 | `title` | 查询单文件夹邮件标题、发件人、时间 | `cookie`, `folder_name` |
 | `title.base64a` | 查询单文件夹邮件标题并返回原始邮件 `Base64A` | `cookie`, `folder_name` |
 | `feishu.notify` | 服务端发送飞书通知 | `cookie`, `body`, `title?`, `tag?` |
@@ -151,11 +153,13 @@
    - num   -> 调用 mail.folder.count 并回写计数
    - title -> 先 count，再调用 title 落盘标题 CSV
    - base64a -> 先 count，再调用 title.base64a（标题落 CSV，原始内容落 SQLite）
-8) 按 idle 执行扩展：
-   - idle=A -> 调用 mail.folder.idle，服务端在该文件夹执行一次性 IMAP IDLE 并记录原始事件日志
-9) 客户端执行 post-flow 再拉取若干轮文件夹（默认 10 轮，每轮间隔 6 秒）
-10) 客户端调用 auth.logout
-11) 服务端清理会话；若长期空闲则触发进程退出
+8) 客户端执行 post-flow 若干轮（默认 11 轮，每轮间隔 12 秒）
+   - 若文件夹 `idle=A`，本轮先调用 `mail.folder.idle` 等待 IMAP 事件
+   - 收到 IDLE 事件后立即退出等待，并对该 IDLE 文件夹执行 mode 增量同步
+   - 未收到事件的 `idle=A` 文件夹本轮跳过 post-flow 兜底；未配置 IDLE 的文件夹继续轻轮询兜底
+   - 每 `WS_POST_FLOW_FOLDER_REFRESH_EVERY` 轮低频刷新远端目录，其余轮读取本地 `folders.csv`
+9) 客户端调用 auth.logout
+10) 服务端清理会话；若长期空闲则触发进程退出
 ```
 
 ### 时序图（客户端/服务端）
@@ -216,19 +220,20 @@ sequenceDiagram
         S-->>C: success_count/results
     end
 
-    opt idle=A
-        C->>S: mail.folder.idle(cookie,folder,idle_mode=A,idle_seconds)
-        S->>I: 一次性 IMAP IDLE
-        I-->>S: 原始 IDLE 行
-        S-->>C: event_count/events
-    end
-
-    loop post-flow 默认 10 轮，每轮 6 秒
-        C->>S: outlook.token.acquire(cookie)
-        S->>I: list mailboxes
-        I-->>S: folders
-        S-->>C: folders
-        C->>C: 重复 mode 同步流程
+    loop post-flow 默认 11 轮，每轮 12 秒
+        opt idle=A
+            C->>S: mail.folder.idle(cookie,folder,idle_mode=A,idle_seconds,return_on_event=true)
+            S->>I: IMAP IDLE
+            I-->>S: 原始 IDLE 行 / 超时
+            S-->>C: event_count/events
+        end
+        opt 到刷新轮
+            C->>S: outlook.token.acquire(cookie)
+            S->>I: list mailboxes
+            I-->>S: folders
+            S-->>C: folders
+        end
+        C->>C: 重复 mode 同步流程（idle=A 且无事件的文件夹本轮跳过）
     end
 
     C->>S: auth.logout(cookie)
@@ -282,7 +287,12 @@ sequenceDiagram
 `idle` 约定：
 
 - 空：不执行 IDLE
-- `A`：执行一次性 IMAP IDLE（原始响应写日志，当前用于观测）
+- `A`：在 post-flow 每轮等待阶段执行 IMAP IDLE；收到事件会提前退出等待并进入增量同步，未收到事件则本轮跳过该文件夹的兜底同步
+
+示例对比配置：
+
+- `Inbox`: `mode=title, idle=A`，只在 IDLE 收到事件时同步；无事件时本轮跳过 post-flow 兜底
+- `Junk`: `mode=title, idle=`，不进入 IDLE，继续每轮 post-flow 兜底
 
 ### 3) 标题结果文件：`db/<前缀>_<文件夹名>.csv`
 
@@ -390,8 +400,9 @@ python main.py
 
 post-flow 环境变量（客户端）：
 
-- `WS_POST_FLOW_FOLDER_PULL_TIMES`：post-flow 拉取轮数，默认 `10`
-- `WS_POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS`：post-flow 轮询间隔秒数，默认 `6`
+- `WS_POST_FLOW_FOLDER_PULL_TIMES`：post-flow 拉取轮数，默认 `11`
+- `WS_POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS`：post-flow 轮询间隔秒数，默认 `12`
+- `WS_POST_FLOW_FOLDER_REFRESH_EVERY`：post-flow 每隔多少轮重新拉取一次远端目录，默认 `10`；设为 `0` 表示 post-flow 只读取本地 `folders.csv`
 
 ---
 
@@ -443,6 +454,49 @@ python test/validate_imap_idle_once.py --mailbox INBOX --idle-seconds 90
 
 ## 🚨 故障排查
 
+### 日志判读
+
+post-flow 汇总日志：
+
+```text
+post-flow light poll 3/11: source=local_csv wait=idle_event idle_folders=1 idle_events=2 folders=8 active_modes=2 idle_skipped=0 count_synced=2 title_fetched=1 notifications=1 elapsed_ms=3118 csv=...
+```
+
+关键字段：
+
+- `wait=idle_event`：本轮 IDLE 收到 IMAP 推送事件，例如 `* 1 RECENT` / `* 27 EXISTS`
+- `wait=idle_timeout`：本轮 IDLE 等待超时，没有收到推送事件
+- `idle_events`：本轮 IDLE 捕获到的原始事件行数量
+- `idle_skipped`：因 `idle=A` 且无事件而跳过 post-flow 兜底的文件夹数
+- `count_synced`：本轮实际执行 `mail.folder.count` 的文件夹数
+- `title_fetched`：本轮增量拉取到的标题数量
+- `notifications`：本轮触发飞书通知的文件夹批次数
+
+IDLE 新邮件典型链路：
+
+```text
+imap idle raw event: folder=Inbox line=* 1 RECENT
+imap idle done raw: folder=Inbox line=* 27 EXISTS
+folder count synced: folder=Inbox request_count=26 online_count=27
+title incremental plan: folder=Inbox ... incremental_count=1
+folder titles fetched: folder=Inbox total=1
+feishu title notify sent: folders=1 targets=3 success=3
+post-flow light poll ... wait=idle_event ... title_fetched=1 notifications=1
+```
+
+这表示 Outlook IMAP IDLE 先主动推送变化，客户端随后退出 IDLE，再通过 count/title 确认并拉取标题。
+
+非 IDLE 文件夹兜底典型链路：
+
+```text
+folder mode skipped by idle policy: folder=Inbox mode=title idle=A reason=no_idle_event
+folder count synced: folder=Junk request_count=10 online_count=11
+folder titles fetched: folder=Junk total=1
+post-flow light poll ... wait=idle_timeout idle_skipped=1 title_fetched=1
+```
+
+这表示 Inbox 本轮无 IDLE 事件被跳过，Junk 仍通过 post-flow 兜底发现新增。
+
 ### 快速排查表
 
 | 现象 | 优先检查 |
@@ -466,12 +520,43 @@ python test/validate_imap_idle_once.py --mailbox INBOX --idle-seconds 90
 
 ---
 
+## 🐛 已知 BUG
+
+### Web 本地 CSV 标题页在客户端执行长 IDLE RPC 时偶发超时
+
+现象：
+
+- 访问 `/view/mail/titles?cookie=...&folder_name=...` 时，服务端通过 `mail.titles.local.list` 请求客户端读取本地 CSV。
+- 如果此时客户端正在等待 `mail.folder.idle` 这类长 RPC，Web 页面请求可能超过 8 秒超时。
+- 日志可能出现：
+
+```text
+server->client rpc timeout: method=mail.titles.local.list rpc_id=... timeout=8s
+skip unmatched rpc response: expect_id=14 payload={..., "error": {"code": -32601, "message": "Method not found: "}}
+```
+
+影响：
+
+- 不影响后台 IMAP IDLE、post-flow 同步、CSV 写入和飞书通知。
+- 只影响 Web 页面读取本地 CSV 的响应稳定性；重试页面通常可恢复。
+
+当前判断：
+
+- 根因倾向于客户端单 WebSocket 接收循环在长 RPC 等待期间与 server -> client 本地 CSV RPC 复用同一通道，导致响应被延迟或错过。
+
+后续修复方向：
+
+- 将 `/view/mail/titles` 的默认本地 CSV 查询改为服务端直接读本地文件，减少 server -> client RPC 依赖。
+- 或拆分客户端的 WebSocket 接收分发机制，避免长 RPC 阻塞页面查询类 server -> client RPC。
+
+---
+
 ## 🏷️ 版本
 
 > 🟢 Stable: `26.4.12M`
 
-当前版本：`26.4.18A`  
-最后更新：`2026-04-18`
+当前版本：`26.5.4A`  
+最后更新：`2026-05-04`
 
 ```text
 版本格式：YY.M.DX
@@ -481,6 +566,18 @@ python test/validate_imap_idle_once.py --mailbox INBOX --idle-seconds 90
 ---
 
 ## 📝 更新日志
+
+### 26.5.4A (2026-05-04)
+
+- ✨ 新增：标题页面默认读取本地 CSV，避免访问 `/view/mail/titles` 时重新拉取全量标题；保留 `live=1` 用于切换实时 IMAP 查询。
+- ✨ 新增：服务端本地标题页日志，记录 `source=local_csv/live_imap`、`csv_path`、`title_items` 与 `mail.titles.local.list` RPC 耗时。
+- 🔧 优化：post-flow 改为轻轮询模式，默认读取本地 `folders.csv` 执行 `mode` 同步，并通过 `WS_POST_FLOW_FOLDER_REFRESH_EVERY` 控制远端目录低频刷新。
+- 🔧 优化：post-flow 默认参数调整为 `11` 轮、每轮 `12` 秒，支持 `WS_POST_FLOW_FOLDER_PULL_TIMES` 与 `WS_POST_FLOW_FOLDER_PULL_INTERVAL_SECONDS` 覆盖。
+- 🔧 优化：`idle=A` 改为参与 post-flow 每轮等待，并支持 `return_on_event`；收到 IMAP IDLE 事件后立即退出等待，进入 count/title 增量同步和飞书通知。
+- 🔧 优化：post-flow 对比模式：`idle=A` 文件夹无事件时跳过兜底同步，未配置 IDLE 的文件夹继续轮询兜底。
+- 🔧 优化：补充 post-flow 与 folder mode 统计日志，新增 `wait`、`idle_folders`、`idle_events`、`idle_skipped`、`count_synced`、`title_fetched`、`notifications` 等字段。
+- 🐛 已知 BUG：Web 本地 CSV 标题页在客户端执行长 IDLE RPC 时偶发 `mail.titles.local.list` 超时或响应错配；已记录在“已知 BUG”章节。
+- 📝 文档：更新 README 与 `/doc/mail`，补齐 IDLE 触发链路、轻轮询策略、日志判读和已知问题说明。
 
 ### 26.4.18A (2026-04-18)
 

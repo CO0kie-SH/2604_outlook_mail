@@ -562,6 +562,7 @@ class InternalWSServer:
     async def _handle_view_mail_titles(self, request: web.Request) -> web.Response:
         cookie = str(request.query.get("cookie", "")).strip()
         folder_name = str(request.query.get("folder_name", "")).strip()
+        live_mode = str(request.query.get("live", "")).strip().lower() in {"1", "true", "yes", "y"}
         if not cookie or not folder_name:
             return web.Response(
                 text=(
@@ -593,7 +594,28 @@ class InternalWSServer:
                 status=404,
             )
 
-        ok, data = await asyncio.to_thread(self._query_folder_titles, cookie, folder_name)
+        data_source = "live_imap" if live_mode else "local_csv"
+        if live_mode:
+            self.logger.info(
+                "view titles live query requested: cookie=%s account=%s folder=%s",
+                cookie,
+                account_hint,
+                folder_name,
+            )
+            ok, data = await asyncio.to_thread(self._query_folder_titles, cookie, folder_name)
+        else:
+            self.logger.info(
+                "view titles local csv requested: cookie=%s account=%s folder=%s",
+                cookie,
+                account_hint,
+                folder_name,
+            )
+            ok, data = await self._call_client_rpc(
+                ws,
+                method=self.RPC_METHOD_LOCAL_TITLE_LIST,
+                params={"cookie": cookie, "folder_name": folder_name},
+                timeout_seconds=8,
+            )
         if not ok:
             message = escape(str(data.get("message", "client rpc failed")))
             return web.Response(
@@ -606,9 +628,19 @@ class InternalWSServer:
                 status=502,
             )
 
-        account = account_hint
+        account = str(data.get("account", "")).strip() or account_hint
+        csv_path = str(data.get("csv_path", "")).strip()
         titles = data.get("titles", [])
         titles = titles if isinstance(titles, list) else []
+        self.logger.info(
+            "view titles success: cookie=%s account=%s folder=%s source=%s csv_path=%s title_items=%s",
+            cookie,
+            account,
+            folder_name,
+            data_source,
+            csv_path,
+            len(titles),
+        )
         title_rows: list[str] = []
         for idx, item in enumerate(titles, start=1):
             if not isinstance(item, dict):
@@ -626,6 +658,10 @@ class InternalWSServer:
             )
 
         rows_html = "".join(title_rows) if title_rows else "<tr><td colspan='7'>(no titles)</td></tr>"
+        local_link = f"/view/mail/titles?cookie={quote(cookie, safe='')}&folder_name={quote(folder_name, safe='')}"
+        live_link = f"{local_link}&live=1"
+        switch_link = local_link if live_mode else live_link
+        switch_text = "local csv" if live_mode else "live imap"
         html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -650,7 +686,10 @@ class InternalWSServer:
       account: <b>{escape(account)}</b><br/>
       cookie: <code>{escape(cookie)}</code><br/>
       folder_name: <b>{escape(folder_name)}</b><br/>
+      source: <b>{escape(data_source)}</b><br/>
+      csv_path: <code>{escape(csv_path or "-")}</code><br/>
       title_count: <b>{len(title_rows)}</b><br/>
+      <a href="{switch_link}">switch to {switch_text}</a><br/>
       <a href="/view/mail/folders?cookie={quote(cookie, safe='')}">返回文件夹列表</a>
     </div>
     <table>
@@ -895,6 +934,15 @@ class InternalWSServer:
                     rpc_id,
                     folder_count,
                 )
+            elif method == self.RPC_METHOD_LOCAL_TITLE_LIST:
+                titles = result.get("titles", [])
+                title_count = len(titles) if isinstance(titles, list) else 0
+                self.logger.info(
+                    "perf rpc titles.local.list(server->client): elapsed_ms=%s rpc_id=%s title_count=%s",
+                    elapsed_ms,
+                    rpc_id,
+                    title_count,
+                )
             self.logger.info(
                 "server->client rpc success: method=%s rpc_id=%s keys=%s",
                 method,
@@ -1007,6 +1055,12 @@ class InternalWSServer:
             idle_mode = str(params.get("idle_mode", "")).strip().upper()
             idle_seconds = self._normalize_positive_int(params.get("idle_seconds")) or 12
             idle_seconds = max(1, min(120, idle_seconds))
+            return_on_event_raw = params.get("return_on_event", False)
+            return_on_event = (
+                str(return_on_event_raw).strip().lower() in {"1", "true", "yes", "y"}
+                if isinstance(return_on_event_raw, str)
+                else bool(return_on_event_raw)
+            )
             if not cookie or not folder_name:
                 return self._rpc_error(rpc_id, -32602, "cookie and folder_name required", req_unixtime), None
 
@@ -1016,6 +1070,7 @@ class InternalWSServer:
                 folder_name,
                 idle_mode,
                 idle_seconds,
+                return_on_event,
             )
             if not ok:
                 return self._rpc_error(rpc_id, -32010, data.get("message", "folder idle failed"), req_unixtime), None
@@ -1335,6 +1390,7 @@ class InternalWSServer:
         folder_name: str,
         idle_mode: str,
         idle_seconds: int,
+        return_on_event: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
         with self._session_lock:
             session = self._sessions.get(cookie)
@@ -1366,12 +1422,14 @@ class InternalWSServer:
                     access_token=access_token,
                     folder_name=folder_name,
                     idle_seconds=idle_seconds,
+                    return_on_event=return_on_event,
                 )
             return True, {
                 "success": True,
                 "folder_name": folder_name,
                 "idle_mode": idle_mode,
                 "idle_seconds": idle_seconds,
+                "return_on_event": return_on_event,
                 "event_count": len(events),
                 "events": events,
                 "update_unixtime_ms": self._now_ms(),
@@ -1579,6 +1637,7 @@ class InternalWSServer:
         access_token: str,
         folder_name: str,
         idle_seconds: int,
+        return_on_event: bool = False,
     ) -> list[str]:
         for attempt in range(2):
             imap = session.get("imap_client")
@@ -1586,7 +1645,13 @@ class InternalWSServer:
                 imap = self._create_authenticated_imap(service, access_token)
                 session["imap_client"] = imap
             try:
-                return self._fetch_folder_idle_events(service, imap, folder_name, idle_seconds)
+                return self._fetch_folder_idle_events(
+                    service,
+                    imap,
+                    folder_name,
+                    idle_seconds,
+                    return_on_event=return_on_event,
+                )
             except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError, EOFError) as exc:
                 self.logger.warning(
                     "folder idle query hit imap connection issue, will retry=%s folder=%s err=%s",
@@ -1619,6 +1684,7 @@ class InternalWSServer:
         imap,
         folder_name: str,
         idle_seconds: int,
+        return_on_event: bool = False,
     ) -> list[str]:
         mailbox_name, _ = service.resolve_mailbox_name(imap, folder_name)
         typ, _ = imap.select(mailbox_name)
@@ -1650,6 +1716,9 @@ class InternalWSServer:
                 continue
             events.append(text)
             self.logger.info("imap idle raw event: folder=%s line=%s", folder_name, text)
+            if return_on_event:
+                self.logger.info("imap idle return on event: folder=%s event_count=%s", folder_name, len(events))
+                break
 
         imap.send(b"DONE\r\n")
         done_deadline = time.time() + 10
@@ -1666,9 +1735,10 @@ class InternalWSServer:
             events.append(text)
 
         self.logger.info(
-            "imap idle once finished: folder=%s idle_seconds=%s event_count=%s",
+            "imap idle wait finished: folder=%s idle_seconds=%s return_on_event=%s event_count=%s",
             folder_name,
             idle_seconds,
+            return_on_event,
             len(events),
         )
         return events

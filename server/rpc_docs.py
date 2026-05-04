@@ -83,11 +83,22 @@ class InternalWSDocPages:
                             ["1", "auth.login", "create session cookie"],
                             ["2", "auth.confirm", "confirm cookie and get enabled methods"],
                             ["3", "outlook.token.acquire", "get/reuse token and folders"],
-                            ["4", "mail.folder.count", "query folder mail count"],
-                            ["5", "title / title.base64a", "title = header only; base64a = include raw body Base64A"],
-                            ["6", "mail.folder.idle", "optional one-shot IMAP IDLE for folders with idle=A"],
-                            ["7", "feishu.notify", "optional summary notify"],
+                            ["4", "initial mode sync", "run mail.folder.count + title/title.base64a for configured mode folders"],
+                            ["5", "post-flow wait", "folders with idle=A enter mail.folder.idle first"],
+                            ["6", "post-flow mode sync", "idle=A folders sync only after IDLE event; non-IDLE folders keep polling fallback"],
+                            ["7", "feishu.notify", "optional summary notify when incremental titles are fetched"],
                             ["8", "auth.logout", "close session and cleanup"],
+                        ],
+                    },
+                },
+                {
+                    "title": "Post-flow IDLE policy",
+                    "body": "During post-flow, folders with idle=A enter IMAP IDLE first. If IDLE captures an event, the client exits IDLE and runs count/title incremental sync for that folder. If no event is captured, that idle=A folder is skipped for this round. Folders without idle=A still run the normal polling fallback.",
+                    "table": {
+                        "headers": ["Folder config", "No IDLE event", "IDLE event"],
+                        "rows": [
+                            ["mode=title, idle=A", "skip this folder's fallback sync for the round", "run count + incremental title sync"],
+                            ["mode=title, idle empty", "run polling fallback", "not applicable"],
                         ],
                     },
                 },
@@ -154,7 +165,7 @@ class InternalWSDocPages:
                 },
                 {
                     "title": "mail.folder.idle",
-                    "body": "Run one-shot IMAP IDLE for one folder and return captured raw lines. Current supported mode is idle_mode=A.",
+                    "body": "Run IMAP IDLE for one folder and return captured raw lines. Current supported mode is idle_mode=A. In post-flow, the client passes return_on_event=true so a pushed RECENT/EXISTS line can wake the sync loop quickly.",
                     "table": {
                         "headers": ["Param", "Type", "Required", "Description"],
                         "rows": [
@@ -162,6 +173,7 @@ class InternalWSDocPages:
                             ["folder_name", "string", "yes", "Folder to idle on"],
                             ["idle_mode", "string", "yes", "Current supports A"],
                             ["idle_seconds", "int", "no", "IDLE duration in seconds, server clamps to 1..120"],
+                            ["return_on_event", "bool", "no", "When true, exit IDLE as soon as the first raw event is captured"],
                         ],
                     },
                 },
@@ -211,6 +223,7 @@ class InternalWSDocPages:
                         "headers": ["Method", "Direction", "Description"],
                         "rows": [
                             ["mail.folders.local.list", "server -> client", "client reads local *_folders.csv and returns rows"],
+                            ["mail.titles.local.list", "server -> client", "client reads local *_<folder>.csv and returns title rows"],
                             ["mail.client.force.logout", "server -> client", "client stops pull loop and calls auth.logout"],
                         ],
                     },
@@ -222,20 +235,37 @@ class InternalWSDocPages:
                         "rows": [
                             ["/view/mail/clients", "list online clients", "none"],
                             ["/view/mail/folders", "view one client's local folder list", "cookie"],
-                            ["/view/mail/titles", "view title list for one folder (server-side title query)", "cookie, folder_name"],
+                            ["/view/mail/titles", "view one folder titles from local CSV by default", "cookie, folder_name"],
+                            ["/view/mail/titles?live=1", "force live IMAP title query for one folder", "cookie, folder_name, live=1"],
                             ["/view/mail/logout", "trigger client force logout", "cookie"],
                         ],
                     },
                 },
                 {
                     "title": "Performance Logs",
-                    "body": "Incremental title sync performance can be observed in log/*.log.",
+                    "body": "Incremental title sync, post-flow, and IDLE behavior can be observed in log/*.log.",
                     "table": {
                         "headers": ["Keyword", "Meaning"],
                         "rows": [
+                            ["post-flow light poll", "round summary; includes wait, idle_events, idle_skipped, title_fetched, notifications"],
+                            ["wait=idle_event", "IDLE pushed an event and woke the round"],
+                            ["wait=idle_timeout", "IDLE waited for idle_seconds without event"],
+                            ["folder mode skipped by idle policy", "idle=A folder skipped fallback because no IDLE event was captured"],
+                            ["imap idle raw event", "raw IMAP IDLE pushed line such as RECENT/EXISTS"],
                             ["perf title incremental", "client-side incremental rpc/write timing"],
                             ["perf query title / perf query title.base64a", "server RPC elapsed time"],
                             ["perf fetch title / perf fetch title.base64a", "server IMAP search/fetch timing details"],
+                        ],
+                    },
+                },
+                {
+                    "title": "Known BUG",
+                    "body": "Web local CSV title pages may occasionally time out while the client is inside a long mail.folder.idle RPC. This does not affect background sync, CSV writes, or Feishu notifications.",
+                    "table": {
+                        "headers": ["Symptom", "Log keyword", "Current workaround"],
+                        "rows": [
+                            ["Opening /view/mail/titles sometimes times out", "server->client rpc timeout: method=mail.titles.local.list", "retry the page after the current IDLE wait finishes"],
+                            ["Late server->client response may be skipped by client", "skip unmatched rpc response", "planned fix: let server read local CSV directly or improve client RPC dispatch"],
                         ],
                     },
                 },

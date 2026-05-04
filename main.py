@@ -63,13 +63,14 @@ def main() -> int:
     logger.info("log_dir=%s", log_dir)
     logger.info("python_path=%s", python_path)
     logger.info(
-        "env constants: profile=%s config_path=%s idle_check_interval_seconds=%s idle_zero_limit=%s post_flow_pull_times=%s post_flow_pull_interval_seconds=%s",
+        "env constants: profile=%s config_path=%s idle_check_interval_seconds=%s idle_zero_limit=%s post_flow_pull_times=%s post_flow_pull_interval_seconds=%s post_flow_folder_refresh_every=%s",
         constants.outlook_profile,
         constants.resolved_config_path(project_dir),
         constants.idle_check_interval_seconds,
         constants.idle_zero_limit,
         constants.post_flow_folder_pull_times,
         constants.post_flow_folder_pull_interval_seconds,
+        constants.post_flow_folder_refresh_every,
     )
 
     server = InternalWSServer(
@@ -87,6 +88,7 @@ def main() -> int:
         logger=logger,
         post_flow_folder_pull_times=constants.post_flow_folder_pull_times,
         post_flow_folder_pull_interval_seconds=constants.post_flow_folder_pull_interval_seconds,
+        post_flow_folder_refresh_every=constants.post_flow_folder_refresh_every,
     )
 
     server.start()
